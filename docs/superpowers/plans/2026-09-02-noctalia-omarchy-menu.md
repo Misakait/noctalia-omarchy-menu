@@ -143,6 +143,45 @@ Implement `plugin.toml` and `panel.luau` with generation-safe async refresh,
 last-known-good behavior, search/navigation/paging, disabled rows, Launcher bridge,
 and safe adapter error notifications. Validate the plugin with Noctalia lint.
 
+The manifest uses plugin API 24, plugin ID `misakait/omarchy-menu`, panel ID `menu`,
+and a 440 by 560 centered floating panel with exclusive keyboard focus. Capture
+lowercase `up`, `down`, `prior`, `next`, `left`, and `right`; Escape remains owned by
+the host. The panel is implemented with Noctalia's retained declarative Luau API and
+starts no background process.
+
+Each `onOpen` increments a generation, marks loading, and calls
+`python3 <pluginDir>/menu_adapter.py render` as argv with a ten-second callback timeout.
+Reject nonzero exit, timeout, either truncation flag, malformed JSON, an unsupported
+schema version, or missing revision/root/entries types. A callback from an older
+generation or a closed panel cannot mutate current state. Failed refreshes keep the
+last known good model visible with an inline error/retry banner; the first failure
+shows a bounded error state. `onClose` invalidates pending callbacks.
+
+Use a focused uncontrolled `ui.input`; changing its component key resets it when the
+Clear affordance is used. Empty search shows the current menu's direct children.
+Nonempty search scans the active subtree using adapter-supplied `search_text`, excludes
+disabled rows, and orders direct children before deeper breadth-first matches. Because
+the API has no scroll-to-index, render a stable visible window of seven or eight rows
+around the selected index and show its range/total.
+
+Keyboard behavior applies only on pressed events: Up/Down move across activatable
+rows, Prior/Next move a page, Right activates, Left navigates to the parent, and input
+submit activates the current (or first activatable) row. Menu/link rows navigate in
+the existing model. Action rows close the panel first, then invoke exactly
+`python3 <adapter> dispatch <revision> <id> <actionToken>` as argv. Dispatch callbacks
+may report only a bounded category/ID/exit-code error, never payloads. This same action
+path makes `apps` close this panel and open Noctalia Launcher through the adapter.
+
+Normal browsing keeps incompatible entries visible but inert, with reduced opacity
+and their adapter-provided reason. Render raw Unicode menu icons as labels, not glyph
+names. Include Back, Close, Clear, Retry, loading, warnings, breadcrumb, and concise
+navigation hints without depending on shell-specific components.
+
+Add contract tests for the manifest and adapter invocation/error-redaction surface,
+plus pure state/search/windowing tests wherever logic can be isolated from the host.
+Use only inert fixtures. Run the repository tests and `noctalia plugins lint`; do not
+open or dispatch any real stock action during validation.
+
 ## Task 5: Install and Niri integration
 
 Install the plugin at `~/.local/share/noctalia/plugins/omarchy-menu`, enable it for
