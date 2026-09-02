@@ -93,6 +93,14 @@ compatibility paths from the approved design. Tests may inject alternate paths a
 runners. Loading compatibility requires a JSON object of rules; malformed or partial
 sources are errors and never silently produce a smaller menu.
 
+The system source is required; an absent extension is the one valid empty-extension
+case. Parse JSONC with duplicate-key detection. Reject empty or reserved `root` IDs,
+wrong types for action/provider/guard fields, truncated input, a missing/non-object
+compatibility rules map, unknown compatibility schema versions, and malformed
+match/mode/dispatch/requires/digests/env values. Unknown descriptive menu fields remain
+forward compatible. An invalid source or compatibility document fails the whole build
+before stdout is written; it never yields a partial model.
+
 Build one model through the same path for render and dispatch:
 
 - reread both menu sources and compatibility on every call, merge by ID/field, and
@@ -100,14 +108,33 @@ Build one model through the same path for render and dispatch:
   from volatile guard/provider results);
 - preserve an exact stock compatibility rule for label/icon/description-only user
   overrides, while treating a new ID or an action/provider change as extension-owned;
+- fail closed when a system-source entry has a known exact rule whose signature drifts;
+  only extension-owned overrides may use generic compositor-neutral pass-through;
 - resolve compatibility before providers and guards, expand providers with bounded
   capture, combine warnings, finalize the hierarchy/search metadata, and redact all
-  action/provider/guard payloads from the view model;
+  action/guard/raw-provider payloads from the view model while retaining the normalized
+  non-sensitive provider identifier required by the public schema;
 - run each trusted guard with `bash -lc` and the exact source expression, a 1.5 second
   timeout, `start_new_session`, and closed standard input; on timeout kill its process
-  group. Preserve the existing eight-second atomic batch deadline;
-- bound provider capture time and output size so a broken helper cannot hang or flood
-  render.
+  group and reap it. The per-expression timeout starts when that subprocess starts, not
+  while work waits behind the eight-worker pool. Preserve the existing eight-second
+  atomic batch deadline and ensure deadline failure cannot leave executor workers or
+  descendants holding the CLI open;
+- capture providers as bytes with a 1.5-second timeout, 256 KiB total stdout limit,
+  4,096-byte line limit, and 2,048-row limit. Invalid UTF-8, NULs, timeout, overflow,
+  or a nonzero exit rejects that provider expansion atomically, emits only a
+  non-sensitive warning, and leaves its provider menu visible without partial rows.
+
+Freeze the public view schema before the panel is written. The top-level keys are
+`schemaVersion`, `revision`, `root`, `entries`, `warnings`, and `source`; `root` is the
+synthetic root entry ID. `source` exposes only the Omarchy package string and whether
+the optional extension was loaded. Entry keys use lower camel case:
+`id`, `parent`, `kind`, `icon`, `iconFont`, `label`, `title`, `target`, `description`,
+`aliases`, `provider`, `header`, `children`, `visible`, `enabled`, `checked`, `disabled`,
+`compatibilityStatus`, `disabledReason`, `order`, `breadcrumb`, `searchText`, and
+optional `actionToken`. Issue a token only for a currently visible, enabled actionable
+leaf. Explicit allow-list and serialized-leakage tests forbid `action`, `dispatch`,
+raw guards, provider output/values, or effective-guard internals.
 
 The CLI contract is:
 
@@ -119,23 +146,30 @@ The CLI contract is:
   returns without waiting for the action result;
 - failures use stable exit categories and a bounded structured stderr record containing
   only category, entry ID when safe, and adapter exit code—never a command, environment,
-  guard expression, or raw action.
+  guard expression, provider output, raw action, traceback, or argparse usage text.
+  A reported ID is limited to 128 safe identifier characters; omit it otherwise.
 
 Resolve action payloads only after successful validation. Shell actions execute as
 `bash -lc` with the exact trusted action string; argv actions stay argv. Plugin-local
 scripts must resolve below the adapter directory, reject traversal, and be executable.
 All dispatched children use `start_new_session=True`, `close_fds=True`, and
 `stdin/stdout/stderr=DEVNULL`, with a copied environment plus only the fixed mapping
-declared by compatibility. Missing commands or scripts fail before spawn.
+declared by compatibility. A single post-validation executor rejects malformed payload
+unions, empty argv, NUL arguments/environment, absolute or escaping script paths,
+escaping symlinks, directories, non-executable files, and missing commands/scripts
+before spawn. Map process-start exceptions to the stable start-failure category.
 
 Write failing tests first for temporary-source end-to-end render/dispatch, malformed
 source and compatibility errors, extension ownership, revision stability, stale
 revision/token rejection, unknown/menu/hidden/disabled rejection, script containment,
-guard descendant cleanup, provider bounds, and stderr/view-model redaction. A safe
+guard descendant cleanup/races/queueing, provider bounds and atomic failure, and
+stderr/view-model allow-list redaction. Assert a spawn sentinel stays at zero for every
+rejected selection and malformed payload. A safe
 fixture child may write a marker under a temporary directory; it must survive adapter
 exit, emit arbitrarily noisy output without corrupting JSON, and prove dispatch returns
 promptly. Assert the rendered stock model exposes the ten approved root categories.
-No test may execute a real stock menu action.
+Invoke subprocess end-to-end tests from outside the project directory as well. No test
+may execute a real stock menu action.
 
 ## Task 4: Noctalia panel
 
@@ -159,7 +193,7 @@ shows a bounded error state. `onClose` invalidates pending callbacks.
 
 Use a focused uncontrolled `ui.input`; changing its component key resets it when the
 Clear affordance is used. Empty search shows the current menu's direct children.
-Nonempty search scans the active subtree using adapter-supplied `search_text`, excludes
+Nonempty search scans the active subtree using adapter-supplied `searchText`, excludes
 disabled rows, and orders direct children before deeper breadth-first matches. Because
 the API has no scroll-to-index, render a stable visible window of seven or eight rows
 around the selected index and show its range/total.
