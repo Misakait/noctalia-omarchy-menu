@@ -339,10 +339,36 @@ class CompatibilityInventoryTests(unittest.TestCase):
             "/usr/bin/omarchy-font-set",
             self.document["rules"]["style.font"]["digests"],
         )
+        self.assertIn(
+            "/usr/bin/omarchy-notification-send",
+            self.document["rules"]["style.font"]["digests"],
+        )
+        self.assertIn(
+            "/usr/bin/omarchy-hook",
+            self.document["rules"]["style.font"]["digests"],
+        )
         self.assertNotIn(
             "/usr/bin/omarchy-restart-shell",
             self.document["rules"]["style.font"]["digests"],
         )
+
+        drifted = json.loads(json.dumps(self.document["rules"]["style.font"]))
+        drifted["digests"]["/usr/bin/omarchy-hook"] = "0" * 64
+        entry = menu_adapter.normalize_menu(
+            {"style.font": self.source["style.font"]}
+        )["style.font"]
+        resolved = menu_adapter.resolve_compatibility(
+            entry,
+            {"style.font": drifted},
+            source="system",
+            dependency_available=lambda _name: True,
+        )
+        self.assertEqual(resolved["compatibility_status"], "disabled")
+        self.assertEqual(
+            resolved["disabled_reason"], "Compatibility not reviewed"
+        )
+        self.assertTrue(resolved["force_visible"])
+        self.assertNotIn("dispatch", resolved)
 
     def test_apps_provider_resolves_to_an_actionable_launcher_bridge(self) -> None:
         entry = menu_adapter.normalize_menu({"apps": self.source["apps"]})["apps"]

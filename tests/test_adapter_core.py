@@ -267,6 +267,23 @@ class CompatibilityTests(unittest.TestCase):
                     },
                 )
 
+    def test_changed_benign_stock_action_is_not_generically_passed_through(self) -> None:
+        entry = menu_adapter.normalize_menu(
+            {"capture": {"action": "notify-send changed-stock-action"}}
+        )["capture"]
+
+        resolved = menu_adapter.resolve_compatibility(
+            entry, self.rule, source="system"
+        )
+
+        self.assertEqual(resolved["compatibility_status"], "disabled")
+        self.assertTrue(resolved["compatibility_disabled"])
+        self.assertTrue(resolved["force_visible"])
+        self.assertEqual(
+            resolved["disabled_reason"], "Compatibility not reviewed"
+        )
+        self.assertNotIn("dispatch", resolved)
+
     def test_source_aware_fallback_trusts_user_action_but_not_unknown_stock_helper(
         self,
     ) -> None:

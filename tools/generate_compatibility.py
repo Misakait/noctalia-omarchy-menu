@@ -195,6 +195,13 @@ def mapped_requirements(rule: dict[str, object]) -> list[str]:
 
 
 HELPER_PATTERN = re.compile(r"\bomarchy-[A-Za-z0-9_-]+\b")
+FONT_PROVIDER_HELPERS = (
+    "omarchy-font-list",
+    "omarchy-font-current",
+    "omarchy-font-set",
+    "omarchy-notification-send",
+    "omarchy-hook",
+)
 
 
 def helper_dependency_closure(
@@ -248,7 +255,9 @@ def opaque_runtime_text(menu_id: str, rule: dict[str, object]) -> str:
         if dispatch.get("mode") == "shell":
             return str(dispatch.get("command", ""))
     if menu_id == "style.font":
-        return "omarchy-font-list omarchy-font-current omarchy-font-set"
+        # This filtered closure mirrors the local font-set wrapper's execution
+        # path while deliberately excluding stock omarchy-restart-shell.
+        return " ".join(FONT_PROVIDER_HELPERS)
     return ""
 
 

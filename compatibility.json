@@ -948,7 +948,9 @@
       "digests": {
         "/usr/bin/omarchy-font-current": "2fbaa43d7d3266ec8ac9201fc5fb36f6bb2295476b3b7dc038348ec76e25022a",
         "/usr/bin/omarchy-font-list": "3b8a4f66d4468d9a152e1b8e8d3baea4d6dbf1f0a5a8988d2846dc88bb77ed2f",
-        "/usr/bin/omarchy-font-set": "0c2eb67a305f37d180adf4fea8039c58866cafb6663ae3c0becbe9336419f0c9"
+        "/usr/bin/omarchy-font-set": "0c2eb67a305f37d180adf4fea8039c58866cafb6663ae3c0becbe9336419f0c9",
+        "/usr/bin/omarchy-hook": "c64ea844feb1849375e7cd43dde98933293b0e0f0f522e1ba2c6572d86386c7b",
+        "/usr/bin/omarchy-notification-send": "93f2e88fe86b03cc636a451cc0b1d766970ef85f32e98eb4fde2bd48a4ba1345"
       }
     },
     "style.bar.transparency": {

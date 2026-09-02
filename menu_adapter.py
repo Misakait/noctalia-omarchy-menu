@@ -502,6 +502,13 @@ def resolve_compatibility(
                         resolved["kind"] = "action"
         return resolved
 
+    if isinstance(rule, dict) and source == "system":
+        resolved["compatibility_status"] = "disabled"
+        resolved["compatibility_disabled"] = True
+        resolved["force_visible"] = True
+        resolved["disabled_reason"] = "Compatibility not reviewed"
+        return resolved
+
     if _obviously_incompatible(action):
         resolved["compatibility_status"] = "disabled"
         resolved["compatibility_disabled"] = True
@@ -517,14 +524,11 @@ def resolve_compatibility(
     elif source == "extension":
         resolved["compatibility_status"] = "user-pass-through"
         resolved["dispatch"] = {"mode": "shell", "command": action}
-    elif re.search(r"(^|[;&|()]|\s)omarchy-[A-Za-z0-9_-]+", action):
+    else:
         resolved["compatibility_status"] = "disabled"
         resolved["compatibility_disabled"] = True
         resolved["force_visible"] = True
         resolved["disabled_reason"] = "Compatibility not reviewed"
-    else:
-        resolved["compatibility_status"] = "pass-through"
-        resolved["dispatch"] = {"mode": "shell", "command": action}
     return resolved
 
 
