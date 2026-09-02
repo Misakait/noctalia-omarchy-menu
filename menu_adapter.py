@@ -25,6 +25,10 @@ class DispatchRejected(ValueError):
         super().__init__(f"dispatch rejected: {reason}")
 
 
+class GuardDeadlineExceeded(RuntimeError):
+    """The guard batch exceeded its deadline, so its model is unsafe to use."""
+
+
 def _strip_jsonc_comments(document: str) -> str:
     output: list[str] = []
     index = 0
@@ -420,8 +424,27 @@ def evaluate_guards(
         _expression, submitted = futures[future]
         return min(submitted + guard_timeout, overall_deadline)
 
+    def record_completed(done: set[Future[bool]]) -> None:
+        for future in done:
+            expression, _submitted = futures[future]
+            try:
+                results[expression] = (bool(future.result(timeout=0)), True)
+            except Exception:
+                results[expression] = (False, False)
+            pending.remove(future)
+
     while pending:
+        record_completed({future for future in pending if future.done()})
+        if not pending:
+            break
+
         now = time.monotonic()
+        if now >= overall_deadline:
+            for future in pending:
+                future.cancel()
+            executor.shutdown(wait=False, cancel_futures=True)
+            raise GuardDeadlineExceeded("overall guard deadline exceeded")
+
         for future in tuple(pending):
             expression, submitted = futures[future]
             if now >= deadline_for(future):
@@ -434,20 +457,7 @@ def evaluate_guards(
 
         next_deadline = min(deadline_for(future) for future in pending)
         done, _ = wait(pending, timeout=max(0.0, next_deadline - time.monotonic()))
-        for future in done:
-            expression, _submitted = futures[future]
-            try:
-                results[expression] = (bool(future.result(timeout=0)), True)
-            except Exception:
-                results[expression] = (False, False)
-            pending.remove(future)
-
-        if time.monotonic() >= overall_deadline:
-            for future in pending:
-                expression, _submitted = futures[future]
-                results[expression] = (False, False)
-                future.cancel()
-            pending.clear()
+        record_completed(done)
     executor.shutdown(wait=False, cancel_futures=True)
 
     warnings: list[str] = []
@@ -489,6 +499,8 @@ def finalize_tree(entries: dict[str, dict[str, object]]) -> dict[str, object]:
     for entry in normalized.values():
         entry["children"] = []
         entry["header"] = _string(entry.get("title")) or _string(entry.get("label"))
+        entry["breadcrumb"] = []
+        entry["search_text"] = ""
         entry.setdefault("visible", True)
         entry.setdefault("enabled", bool(entry["visible"]))
         entry.setdefault("checked_state", False)
@@ -609,6 +621,30 @@ def finalize_tree(entries: dict[str, dict[str, object]]) -> dict[str, object]:
         entry["children"] = [
             child for child in entry["children"] if normalized[child]["visible"]
         ]
+
+    def decorate_reachable(menu_id: str, ancestors: list[str]) -> None:
+        entry = normalized[menu_id]
+        breadcrumb = (
+            ancestors
+            if menu_id == "root"
+            else ancestors + [_string(entry.get("header"))]
+        )
+        entry["breadcrumb"] = breadcrumb
+        aliases = entry.get("aliases", [])
+        alias_terms = (
+            [alias for alias in aliases if isinstance(alias, str)]
+            if isinstance(aliases, list)
+            else []
+        )
+        entry["search_text"] = " ".join(
+            term.casefold()
+            for term in [*breadcrumb, _string(entry.get("description")), *alias_terms]
+            if term
+        )
+        for child in entry["children"]:
+            decorate_reachable(child, breadcrumb)
+
+    decorate_reachable("root", [])
 
     return {"root": "root", "entries": normalized, "warnings": warnings}
 

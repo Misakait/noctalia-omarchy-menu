@@ -12,6 +12,7 @@ spawn a configured action.  The implementation API expected by this suite is:
     Return ``(entries, warnings)``.  ``runner(expression)`` returns truthiness or
     raises on command failure/timeout.  Output entries expose ``visible``,
     ``checked_state``, ``disabled_state``, and ``enabled``.
+    ``GuardDeadlineExceeded`` means no partial guard model may be used.
 
 ``finalize_tree(entries)`` and ``search_entries(model, menu_id, query)``
     Return a model containing ``root``, ``entries``, and non-fatal ``warnings``;
@@ -178,6 +179,27 @@ class GuardEvaluationTests(unittest.TestCase):
         self.assertLess(time.monotonic() - started, 0.04)
         self.assertFalse(evaluated["slow"]["visible"])
 
+    def test_overall_deadline_rejects_the_entire_guard_refresh_promptly(self) -> None:
+        """An unfinished overall guard batch cannot produce a partial model."""
+
+        def runner(_expression: str) -> bool:
+            time.sleep(0.06)
+            return True
+
+        started = time.monotonic()
+        with self.assertRaises(menu_adapter.GuardDeadlineExceeded):
+            menu_adapter.evaluate_guards(
+                {
+                    "one": _entry("one", when="one-expression"),
+                    "two": _entry("two", when="two-expression"),
+                },
+                runner,
+                per_guard_timeout=0.2,
+                overall_timeout=0.01,
+                max_workers=1,
+            )
+        self.assertLess(time.monotonic() - started, 0.04)
+
 
 class CompatibilityTests(unittest.TestCase):
     def setUp(self) -> None:
@@ -301,6 +323,37 @@ class CompatibilityTests(unittest.TestCase):
 
 
 class TreeAndSearchTests(unittest.TestCase):
+    def test_reachable_entries_get_safe_breadcrumb_and_search_text(self) -> None:
+        entries = menu_adapter.normalize_menu(
+            {
+                "style": {"label": "Style", "title": "Appearance"},
+                "style.wallpaper": {
+                    "label": "Wallpaper",
+                    "description": "Choose a background",
+                    "aliases": ["Backdrop"],
+                    "action": "secret-action",
+                },
+                "orphan": {
+                    "parent": "missing",
+                    "label": "Orphan",
+                    "action": "another-secret-action",
+                },
+            }
+        )
+        _mark_guard_state(entries)
+
+        model = menu_adapter.finalize_tree(entries)
+
+        wallpaper = model["entries"]["style.wallpaper"]
+        self.assertEqual(wallpaper["breadcrumb"], ["Appearance", "Wallpaper"])
+        self.assertEqual(
+            wallpaper["search_text"],
+            "appearance wallpaper choose a background backdrop",
+        )
+        self.assertNotIn("secret-action", wallpaper["search_text"])
+        self.assertEqual(model["entries"]["orphan"]["breadcrumb"], [])
+        self.assertEqual(model["entries"]["orphan"]["search_text"], "")
+
     def test_menu_and_link_visibility_follows_visible_descendants(self) -> None:
         entries = menu_adapter.normalize_menu(
             {
