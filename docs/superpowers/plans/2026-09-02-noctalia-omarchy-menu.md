@@ -88,6 +88,55 @@ model, validates the selection, and detaches the resolved action with closed sta
 streams. Add fixtures proving stale and invalid selections cannot spawn and a safe
 long-lived/noisy child does not hold the adapter open.
 
+Production defaults are the fixed system menu, user extension, and plugin-local
+compatibility paths from the approved design. Tests may inject alternate paths and
+runners. Loading compatibility requires a JSON object of rules; malformed or partial
+sources are errors and never silently produce a smaller menu.
+
+Build one model through the same path for render and dispatch:
+
+- reread both menu sources and compatibility on every call, merge by ID/field, and
+  compute the revision from the merged raw menu plus compatibility content (never
+  from volatile guard/provider results);
+- preserve an exact stock compatibility rule for label/icon/description-only user
+  overrides, while treating a new ID or an action/provider change as extension-owned;
+- resolve compatibility before providers and guards, expand providers with bounded
+  capture, combine warnings, finalize the hierarchy/search metadata, and redact all
+  action/provider/guard payloads from the view model;
+- run each trusted guard with `bash -lc` and the exact source expression, a 1.5 second
+  timeout, `start_new_session`, and closed standard input; on timeout kill its process
+  group. Preserve the existing eight-second atomic batch deadline;
+- bound provider capture time and output size so a broken helper cannot hang or flood
+  render.
+
+The CLI contract is:
+
+- `render` writes exactly one schema-versioned JSON object to stdout;
+- `audit` is read-only, reports classification/digest coverage, and exits nonzero for
+  an incomplete or invalid inventory;
+- `dispatch REVISION ID TOKEN` rebuilds the model, validates all three opaque
+  selectors plus visibility/enabled/action kind, spawns the resolved action, and
+  returns without waiting for the action result;
+- failures use stable exit categories and a bounded structured stderr record containing
+  only category, entry ID when safe, and adapter exit code—never a command, environment,
+  guard expression, or raw action.
+
+Resolve action payloads only after successful validation. Shell actions execute as
+`bash -lc` with the exact trusted action string; argv actions stay argv. Plugin-local
+scripts must resolve below the adapter directory, reject traversal, and be executable.
+All dispatched children use `start_new_session=True`, `close_fds=True`, and
+`stdin/stdout/stderr=DEVNULL`, with a copied environment plus only the fixed mapping
+declared by compatibility. Missing commands or scripts fail before spawn.
+
+Write failing tests first for temporary-source end-to-end render/dispatch, malformed
+source and compatibility errors, extension ownership, revision stability, stale
+revision/token rejection, unknown/menu/hidden/disabled rejection, script containment,
+guard descendant cleanup, provider bounds, and stderr/view-model redaction. A safe
+fixture child may write a marker under a temporary directory; it must survive adapter
+exit, emit arbitrarily noisy output without corrupting JSON, and prove dispatch returns
+promptly. Assert the rendered stock model exposes the ten approved root categories.
+No test may execute a real stock menu action.
+
 ## Task 4: Noctalia panel
 
 Implement `plugin.toml` and `panel.luau` with generation-safe async refresh,
