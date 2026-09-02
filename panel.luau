@@ -291,7 +291,12 @@ local function rowNode(id)
   local icon = stringValue(entry.icon)
   local label = stringValue(entry.label)
   local title = icon ~= "" and (icon .. " " .. label) or label
-  local props = { key = "row-" .. id, gap = 8, align = "center", selected = id == selectedId }
+  local props = { key = "row-" .. id, gap = 8, align = "center", paddingH = 6, paddingV = 4, radius = 6 }
+  if id == selectedId then
+    props.fill = "primary/0.10"
+    props.border = "primary/0.55"
+    props.borderWidth = 1
+  end
   if not isActivatable(entry) then props.opacity = 0.5 else props.onClick = function() activate(id) end end
   local children = {
     ui.label({ text = title, flexGrow = 1 }),
@@ -361,7 +366,9 @@ render = function()
     ui.button({ text = "Back", variant = "ghost", onClick = navigateParent }),
     ui.label({ text = "↑↓ select  PgUp/PgDn page  ← back  → open", fontSize = 11, color = "on_surface_variant" }),
   }))
-  return ui.column({ key = "menu-root", flexGrow = 1, gap = 8, align = "stretch" }, body)
+  local tree = ui.column({ key = "menu-root", flexGrow = 1, gap = 8, align = "stretch" }, body)
+  panel.render(tree)
+  return tree
 end
 
 function onOpen(_context)

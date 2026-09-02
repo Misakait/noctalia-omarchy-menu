@@ -9,6 +9,8 @@ local function equal(actual, expected, message)
 end
 
 local renders = 0
+local panelRenders = 0
+local lastPanelTree = nil
 local runs = {}
 local notifications = {}
 local nextRunReturns = true
@@ -49,10 +51,16 @@ noctalia = {
   end,
 }
 
-panel = { close = function()
-  closed = closed + 1
-  onClose()
-end }
+panel = {
+  close = function()
+    closed = closed + 1
+    onClose()
+  end,
+  render = function(tree)
+    panelRenders = panelRenders + 1
+    lastPanelTree = tree
+  end,
+}
 
 local originalRender = nil
 dofile("panel.luau")
@@ -102,7 +110,7 @@ end
 
 local function selectedRowKey()
   local selected = find(render(), function(item)
-    return item.kind == "row" and item.props.selected == true and string.sub(item.props.key or "", 1, 4) == "row-"
+    return item.kind == "row" and item.props.fill == "primary/0.10" and string.sub(item.props.key or "", 1, 4) == "row-"
   end)
   return selected and selected.props.key or ""
 end
@@ -118,6 +126,8 @@ local function reset()
   decodeValues = {}
   closed = 0
   renders = 0
+  panelRenders = 0
+  lastPanelTree = nil
   onClose()
 end
 
@@ -144,6 +154,18 @@ local function test_generation_and_last_known_good()
   check(hasText(render(), "Refresh unavailable"), "bounded refresh error")
   old.callback({ exitCode = 0, stdout = "ERROR" })
   check(hasText(render(), "Run"), "old callback cannot replace model")
+  cases = cases + 1
+end
+
+local function test_open_commits_tree_to_host_panel()
+  reset()
+  decodeValues.good = fixture()
+  onOpen({})
+  equal(panelRenders, 1, "opening commits loading tree through panel.render")
+  check(lastPanelTree ~= nil and hasText(lastPanelTree, "Loading…"), "host receives loading tree")
+  runs[1].callback({ exitCode = 0, stdout = "good" })
+  equal(panelRenders, 2, "completed refresh commits model tree through panel.render")
+  check(hasText(lastPanelTree, "Run"), "host receives populated tree")
   cases = cases + 1
 end
 
@@ -244,10 +266,12 @@ end
 local function test_keyboard_pressed_navigation_and_parent()
   reset()
   openGood()
+  check(find(render(), function(item) return item.kind == "row" and item.props.selected ~= nil end) == nil,
+    "row selection uses supported visual props")
   onKey({ key = "down", pressed = false })
-  check(row("row-folder").props.selected == true, "released key ignored")
+  equal(selectedRowKey(), "row-folder", "released key ignored")
   onKey({ key = "down", pressed = true })
-  check(row("row-run").props.selected == true, "down moves selection")
+  equal(selectedRowKey(), "row-run", "down moves selection")
   onKey({ key = "up", pressed = true })
   onKey({ key = "right", pressed = true })
   check(hasText(render(), "Folder"), "right opens selected menu")
@@ -362,6 +386,7 @@ local function test_submit_uses_selected_row_and_retry_starts_new_generation()
 end
 
 test_generation_and_last_known_good()
+test_open_commits_tree_to_host_panel()
 test_later_success_wins_over_older_success()
 test_rejects_bad_results_and_spawn_failure()
 test_close_invalidates_render_callback_without_rendering()
@@ -375,5 +400,5 @@ test_pointer_dispatch_closes_first_and_is_exact_argv()
 test_long_ids_dispatch_unchanged_but_notifications_are_bounded()
 test_submit_uses_selected_row_and_retry_starts_new_generation()
 
-equal(cases, 13, "case count")
-print("panel harness: 13 passed")
+equal(cases, 14, "case count")
+print("panel harness: 14 passed")
