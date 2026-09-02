@@ -189,27 +189,39 @@ Reject nonzero exit, timeout, either truncation flag, malformed JSON, an unsuppo
 schema version, or missing revision/root/entries types. A callback from an older
 generation or a closed panel cannot mutate current state. Failed refreshes keep the
 last known good model visible with an inline error/retry banner; the first failure
-shows a bounded error state. `onClose` invalidates pending callbacks.
+shows a bounded error state. Retry starts a new generation. Treat an immediate `false`
+return from `noctalia.runAsync` as a spawn failure because no callback will arrive.
+`onClose` marks the panel closed and increments the generation to invalidate every
+pending render callback without rendering again. Decode with
+`pcall(noctalia.json.decode, stdout)` and validate `entries[root]` before replacement.
 
 Use a focused uncontrolled `ui.input`; changing its component key resets it when the
 Clear affordance is used. Empty search shows the current menu's direct children.
 Nonempty search scans the active subtree using adapter-supplied `searchText`, excludes
 disabled rows, and orders direct children before deeper breadth-first matches. Because
-the API has no scroll-to-index, render a stable visible window of seven or eight rows
-around the selected index and show its range/total.
+the API has no scroll-to-index, render a stable visible window of exactly eight rows
+around the selected index and show its range/total. Keep selection by stable ID and
+fall back to the first activatable row when filtering/navigation invalidates it.
 
 Keyboard behavior applies only on pressed events: Up/Down move across activatable
 rows, Prior/Next move a page, Right activates, Left navigates to the parent, and input
 submit activates the current (or first activatable) row. Menu/link rows navigate in
 the existing model. Action rows close the panel first, then invoke exactly
 `python3 <adapter> dispatch <revision> <id> <actionToken>` as argv. Dispatch callbacks
-may report only a bounded category/ID/exit-code error, never payloads. This same action
-path makes `apps` close this panel and open Noctalia Launcher through the adapter.
+remain active after close and may report only a bounded category/ID/exit-code error,
+never payloads or adapter stdout/stderr. This same action path makes `apps` close this
+panel and open Noctalia Launcher through the adapter.
 
 Normal browsing keeps incompatible entries visible but inert, with reduced opacity
 and their adapter-provided reason. Render raw Unicode menu icons as labels, not glyph
 names. Include Back, Close, Clear, Retry, loading, warnings, breadcrumb, and concise
 navigation hints without depending on shell-specific components.
+
+Use only APIs present in the installed retained DSL: `ui.row({ onClick = ... }, ...)`
+or `ui.button` for pointer activation (there is no `ui.clickable`), `ui.input` with
+`focus = true`, a revision-based `key`, `onChange`, and `onSubmit`,
+`noctalia.runAsync`, `noctalia.json.decode`, `noctalia.notifyError`, and
+`panel.close()`. Disabled compound rows omit `onClick`; do not merely rely on opacity.
 
 Add contract tests for the manifest and adapter invocation/error-redaction surface,
 plus pure state/search/windowing tests wherever logic can be isolated from the host.
