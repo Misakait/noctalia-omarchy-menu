@@ -1,0 +1,22 @@
+id = "misakait/omarchy-menu"
+name = "Omarchy Menu"
+version = "0.1.0"
+plugin_api = 24
+author = "misakait"
+license = "MIT"
+dependencies = ["python3", "omarchy"]
+tags = ["system", "utility", "niri"]
+icon = "menu-2"
+description = "A Noctalia-native Omarchy menu adapted for Niri."
+
+[[panel]]
+id = "menu"
+entry = "panel.luau"
+width = 440
+height = 560
+placement = "floating"
+position = "center"
+open_near_click = false
+dismiss_on_outside_click = true
+keyboard_focus = "exclusive"
+capture_keys = ["up", "down", "prior", "next", "left", "right"]
