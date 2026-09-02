@@ -189,6 +189,31 @@ the next Noctalia start when IPC is unavailable, replace only `Mod+Alt+Space`, a
 the two Omarchy floating app-id rules, and perform candidate/pre/post validation with
 rollback on failure.
 
+Stage a direct runtime copy (manifest, panel, adapter, compatibility file, and helper
+scripts) beside the final plugin directory, preserve modes, and lint the staged plugin.
+If a previous installation exists, rename it to a timestamped recoverable backup; then
+atomically rename the staging directory into place. Do not install a symlink and do not
+copy repository metadata, test fixtures, or the SDD workspace.
+
+Enable `misakait/omarchy-menu` through Noctalia IPC when a live daemon is available.
+Otherwise update only the enabled-plugin array in
+`~/.local/state/noctalia/settings.toml` through a same-directory candidate, validate
+the candidate, create a timestamped backup, and atomically replace the live file.
+Preserve every unrelated setting and avoid duplicate IDs.
+
+For `~/.config/niri/config.kdl`, create a same-directory candidate and change only the
+existing `Mod+Alt+Space` action from Noctalia control center to
+`noctalia msg panel-toggle misakait/omarchy-menu:menu`. Leave `Mod+Space` Launcher and
+the Noctalia clipboard binding untouched. Add floating rules matching
+`org.omarchy.about` and `org.omarchy.terminal`. Validate the candidate with Niri,
+create a timestamped backup of the current live file, atomically replace it, and
+validate the live result. Any post-validation failure restores the backup before
+returning an error.
+
+After installation, lint the final plugin and validate both live configuration files.
+If Niri/Noctalia IPC is unavailable, record that live UI reload/smoke is deferred to
+the next graphical session rather than starting an extra shell or compositor process.
+
 ## Task 6: Final verification and review
 
 Run the full unit suite, adapter audit/render checks, Noctalia lint, Niri validation,
