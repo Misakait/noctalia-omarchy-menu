@@ -135,18 +135,19 @@ local function visibleWindow(rows, selected)
   return window, start, finish
 end
 
-local function safeId(value)
+local function notificationId(value)
   local id = stringValue(value)
   if id == "" or #id > 96 or not string.match(id, "^[%w_.:-]+$") then return "selection" end
   return id
 end
 
-local function dispatch(entry)
+local function dispatch(entry, entryId)
   if model == nil or not isActivatable(entry) or stringValue(entry.kind) ~= "action" then return end
   local revision = stringValue(model.revision)
-  local id = safeId(entry.id)
+  local id = stringValue(entryId)
   local token = stringValue(entry.actionToken)
-  if revision == "" or token == "" or id == "selection" then return end
+  if revision == "" or token == "" or id == "" then return end
+  local displayId = notificationId(id)
 
   -- The host owns onClose; invoking close before creating the process prevents a
   -- dispatched action from changing the still-visible retained tree.
@@ -157,13 +158,13 @@ local function dispatch(entry)
       if result == nil or result.timedOut == true or result.exitCode ~= 0 then
         local code = result and tonumber(result.exitCode) or nil
         local suffix = code and (" (exit " .. tostring(code) .. ")") or ""
-        noctalia.notifyError("Omarchy Menu", "Action failed: " .. id .. suffix)
+        noctalia.notifyError("Omarchy Menu", "Action failed: " .. displayId .. suffix)
       end
     end,
     DISPATCH_TIMEOUT_MS
   )
   if started == false then
-    noctalia.notifyError("Omarchy Menu", "Action failed: " .. id)
+    noctalia.notifyError("Omarchy Menu", "Action failed: " .. displayId)
   end
 end
 
@@ -182,7 +183,7 @@ local function activate(id)
     ensureSelection(rowsForCurrent())
     render()
   else
-    dispatch(entry)
+    dispatch(entry, id)
   end
 end
 
@@ -254,6 +255,28 @@ local function moveSelection(delta)
   end
 end
 
+local function movePage(delta)
+  local rows = rowsForCurrent()
+  local selected = ensureSelection(rows)
+  if selected == nil then return end
+  local target = math.max(1, math.min(#rows, selected + delta))
+  local direction = delta < 0 and -1 or 1
+  local function selectFrom(index, step)
+    while index >= 1 and index <= #rows do
+      if isActivatable(entryFor(rows[index])) then
+        selectedId = rows[index]
+        render()
+        return true
+      end
+      index = index + step
+    end
+    return false
+  end
+  if not selectFrom(target, direction) then
+    selectFrom(target - direction, -direction)
+  end
+end
+
 local function breadcrumb()
   local current = entryFor(currentId)
   if current == nil then return "Go" end
@@ -268,7 +291,7 @@ local function rowNode(id)
   local icon = stringValue(entry.icon)
   local label = stringValue(entry.label)
   local title = icon ~= "" and (icon .. " " .. label) or label
-  local props = { key = "row-" .. stringValue(entry.id), gap = 8, align = "center", selected = id == selectedId }
+  local props = { key = "row-" .. id, gap = 8, align = "center", selected = id == selectedId }
   if not isActivatable(entry) then props.opacity = 0.5 else props.onClick = function() activate(id) end end
   local children = {
     ui.label({ text = title, flexGrow = 1 }),
@@ -361,8 +384,8 @@ function onKey(event)
   local key = string.lower(stringValue(event.key))
   if key == "up" then moveSelection(-1)
   elseif key == "down" then moveSelection(1)
-  elseif key == "prior" then moveSelection(-WINDOW_SIZE)
-  elseif key == "next" then moveSelection(WINDOW_SIZE)
+  elseif key == "prior" then movePage(-WINDOW_SIZE)
+  elseif key == "next" then movePage(WINDOW_SIZE)
   elseif key == "left" then navigateParent()
   elseif key == "right" then
     local rows = rowsForCurrent()

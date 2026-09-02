@@ -14,6 +14,7 @@ local notifications = {}
 local nextRunReturns = true
 local decodeValues = {}
 local closed = 0
+local longActionId = string.rep("long-action-id-", 8)
 
 local function node(kind, props, children)
   return { kind = kind, props = props or {}, children = children or {} }
@@ -48,7 +49,10 @@ noctalia = {
   end,
 }
 
-panel = { close = function() closed = closed + 1 end }
+panel = { close = function()
+  closed = closed + 1
+  onClose()
+end }
 
 local originalRender = nil
 dofile("panel.luau")
@@ -58,20 +62,24 @@ render = function()
   return originalRender()
 end
 
-local function fixture()
+local function fixture(revision, runLabel)
   local entries = {
-    root = { id = "root", kind = "menu", label = "Go", header = "Go", parent = "", children = { "folder", "run", "disabled", "apps", "r1", "r2", "r3", "r4", "r5", "r6", "r7", "r8", "r9" }, visible = true, enabled = true, breadcrumb = {} },
+    root = { id = "root", kind = "menu", label = "Go", header = "Go", parent = "", children = { "folder", "run", "disabled", "apps", "link", longActionId, "page", "r1", "r2", "r3", "r4", "r5", "r6", "r7", "r8", "r9", "r10", "r11", "r12" }, visible = true, enabled = true, breadcrumb = {} },
     folder = { id = "folder", kind = "menu", label = "Folder", header = "Folder", parent = "root", children = { "deep" }, visible = true, enabled = true, searchText = "folder needle" },
-    run = { id = "run", kind = "action", label = "Run", parent = "root", children = {}, visible = true, enabled = true, actionToken = "token-run", searchText = "run needle" },
+    run = { id = "run", kind = "action", label = runLabel or "Run", parent = "root", children = {}, visible = true, enabled = true, actionToken = "token-run", searchText = "run needle" },
     disabled = { id = "disabled", kind = "action", label = "Disabled", parent = "root", children = {}, visible = true, enabled = false, disabled = true, disabledReason = "Unsupported provider", searchText = "disabled needle" },
     apps = { id = "apps", kind = "action", label = "Apps", parent = "root", children = {}, visible = true, enabled = true, actionToken = "token-apps", searchText = "apps" },
+    link = { id = "link", kind = "link", label = "Folder link", parent = "root", target = "folder", children = {}, visible = true, enabled = true, searchText = "link" },
+    [longActionId] = { id = longActionId, kind = "action", label = "Long action", parent = "root", children = {}, visible = true, enabled = true, actionToken = "token-long", searchText = "long" },
+    page = { id = "page", kind = "menu", label = "Page", header = "Page", parent = "root", children = { "r1", "r2", "r3", "r4", "r5", "r6", "r7", "r8", "r9", "r10", "r11", "r12" }, visible = true, enabled = true, searchText = "page" },
     deep = { id = "deep", kind = "action", label = "Deep", parent = "folder", children = {}, visible = true, enabled = true, actionToken = "token-deep", searchText = "deep needle" },
   }
-  for index = 1, 9 do
+  for index = 1, 12 do
     local id = "r" .. tostring(index)
-    entries[id] = { id = id, kind = "action", label = "Row " .. tostring(index), parent = "root", children = {}, visible = true, enabled = true, actionToken = "token-" .. id, searchText = "row" }
+    local disabledRow = index == 5 or index == 9 or index == 12
+    entries[id] = { id = id, kind = "action", label = "Row " .. tostring(index), parent = "root", children = {}, visible = true, enabled = not disabledRow, disabled = disabledRow, actionToken = "token-" .. id, searchText = "row" }
   end
-  return { schemaVersion = 1, revision = "rev-1", root = "root", entries = entries, warnings = { "Provider unavailable: fonts" }, source = {} }
+  return { schemaVersion = 1, revision = revision or "rev-1", root = "root", entries = entries, warnings = { "Provider unavailable: fonts" }, source = {} }
 end
 
 local function find(tree, predicate)
@@ -90,6 +98,13 @@ end
 local function row(key)
   local tree = render()
   return find(tree, function(item) return item.kind == "row" and item.props.key == key end)
+end
+
+local function selectedRowKey()
+  local selected = find(render(), function(item)
+    return item.kind == "row" and item.props.selected == true and string.sub(item.props.key or "", 1, 4) == "row-"
+  end)
+  return selected and selected.props.key or ""
 end
 
 local function input()
@@ -129,6 +144,20 @@ local function test_generation_and_last_known_good()
   check(hasText(render(), "Refresh unavailable"), "bounded refresh error")
   old.callback({ exitCode = 0, stdout = "ERROR" })
   check(hasText(render(), "Run"), "old callback cannot replace model")
+  cases = cases + 1
+end
+
+local function test_later_success_wins_over_older_success()
+  reset()
+  decodeValues.old = fixture("old-revision", "Older render")
+  decodeValues.new = fixture("new-revision", "Newer render")
+  onOpen({})
+  onOpen({})
+  runs[2].callback({ exitCode = 0, stdout = "new" })
+  check(hasText(render(), "Newer render"), "newer render installed")
+  runs[1].callback({ exitCode = 0, stdout = "old" })
+  check(hasText(render(), "Newer render"), "older success cannot replace newer LKG")
+  check(not hasText(render(), "Older render"), "older label remains absent")
   cases = cases + 1
 end
 
@@ -227,6 +256,41 @@ local function test_keyboard_pressed_navigation_and_parent()
   cases = cases + 1
 end
 
+local function test_keyboard_and_pointer_links_navigate_to_target()
+  reset()
+  openGood()
+  onKey({ key = "down", pressed = true })
+  onKey({ key = "down", pressed = true })
+  onKey({ key = "down", pressed = true })
+  onKey({ key = "right", pressed = true })
+  check(row("row-deep") ~= nil, "keyboard right follows link target")
+  reset()
+  openGood()
+  row("row-link").props.onClick()
+  check(row("row-deep") ~= nil, "pointer follows link target")
+  cases = cases + 1
+end
+
+local function test_page_navigation_clamps_and_skips_disabled_landing_rows()
+  reset()
+  openGood()
+  row("row-page").props.onClick()
+  equal(selectedRowKey(), "row-r1", "page starts at first activatable row")
+  onKey({ key = "next", pressed = true })
+  equal(selectedRowKey(), "row-r10", "next skips disabled r9 in requested direction")
+  onKey({ key = "next", pressed = true })
+  equal(selectedRowKey(), "row-r11", "next clamps then searches back from disabled edge")
+  onKey({ key = "next", pressed = true })
+  equal(selectedRowKey(), "row-r11", "next may remain at clamped disabled edge")
+  onKey({ key = "prior", pressed = true })
+  equal(selectedRowKey(), "row-r3", "prior uses non-cyclic page target")
+  onKey({ key = "prior", pressed = true })
+  equal(selectedRowKey(), "row-r1", "prior clamps at first row")
+  onKey({ key = "prior", pressed = true })
+  equal(selectedRowKey(), "row-r1", "prior remains at first edge")
+  cases = cases + 1
+end
+
 local function test_disabled_rows_are_inert_but_visible()
   reset()
   openGood()
@@ -254,8 +318,30 @@ local function test_pointer_dispatch_closes_first_and_is_exact_argv()
   equal(argv[6], "token-run", "dispatch opaque token")
   runs[2].callback({ exitCode = 7, stdout = "SECRET_STDOUT", stderr = "SECRET_STDERR" })
   equal(#notifications, 1, "dispatch failure notified")
-  check(not string.find(notifications[1].message, "SECRET", 1, true), "dispatch payload output redacted")
+  for _, secret in ipairs({ "SECRET_STDOUT", "SECRET_STDERR", "rev-1", "token-run", "payload" }) do
+    check(not string.find(notifications[1].message, secret, 1, true), "dispatch error redacts " .. secret)
+  end
   check(string.find(notifications[1].message, "run", 1, true), "bounded ID included")
+  cases = cases + 1
+end
+
+local function test_long_ids_dispatch_unchanged_but_notifications_are_bounded()
+  reset()
+  openGood()
+  row("row-" .. longActionId).props.onClick()
+  equal(runs[2].argv[5], longActionId, "pointer keeps complete long adapter ID")
+  runs[2].callback({ exitCode = 9, stdout = "RAW", stderr = "RAW" })
+  equal(notifications[1].message, "Action failed: selection (exit 9)", "long ID notification is bounded")
+  reset()
+  openGood()
+  input().props.onChange("long")
+  input().props.onSubmit("long")
+  equal(runs[2].argv[5], longActionId, "submit keeps complete long adapter ID")
+  reset()
+  openGood()
+  nextRunReturns = false
+  row("row-run").props.onClick()
+  equal(notifications[1].message, "Action failed: run", "immediate false uses fixed redacted error")
   cases = cases + 1
 end
 
@@ -276,14 +362,18 @@ local function test_submit_uses_selected_row_and_retry_starts_new_generation()
 end
 
 test_generation_and_last_known_good()
+test_later_success_wins_over_older_success()
 test_rejects_bad_results_and_spawn_failure()
 test_close_invalidates_render_callback_without_rendering()
 test_search_is_breadth_first_and_excludes_disabled()
 test_clear_rekeys_input_and_window_is_eight_rows()
 test_keyboard_pressed_navigation_and_parent()
+test_keyboard_and_pointer_links_navigate_to_target()
+test_page_navigation_clamps_and_skips_disabled_landing_rows()
 test_disabled_rows_are_inert_but_visible()
 test_pointer_dispatch_closes_first_and_is_exact_argv()
+test_long_ids_dispatch_unchanged_but_notifications_are_bounded()
 test_submit_uses_selected_row_and_retry_starts_new_generation()
 
-equal(cases, 9, "case count")
-print("panel harness: 9 passed")
+equal(cases, 13, "case count")
+print("panel harness: 13 passed")

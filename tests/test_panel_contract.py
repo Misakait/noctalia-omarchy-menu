@@ -38,7 +38,7 @@ class PanelManifestContractTests(unittest.TestCase):
         )
 
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        self.assertIn("panel harness: 9 passed", result.stdout)
+        self.assertIn("panel harness: 13 passed", result.stdout)
 
 
 if __name__ == "__main__":
