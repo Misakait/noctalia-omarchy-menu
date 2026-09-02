@@ -323,6 +323,7 @@ def _validate_compatibility(document: object) -> dict[str, object]:
         if not isinstance(digests, dict) or not all(
             isinstance(path, str)
             and Path(path).is_absolute()
+            and "\0" not in path
             and isinstance(digest, str)
             and bool(_HEX_DIGEST.fullmatch(digest))
             for path, digest in digests.items()
@@ -518,7 +519,7 @@ def _file_sha256(path: Path) -> str | None:
             for chunk in iter(lambda: handle.read(1024 * 1024), b""):
                 hasher.update(chunk)
         return hasher.hexdigest()
-    except OSError:
+    except (OSError, ValueError):
         return None
 
 
@@ -807,6 +808,7 @@ class ProviderRunner:
         current_line = 0
         rows = 0
         failed = False
+        succeeded = False
         try:
             while selector.get_map():
                 remaining = deadline - time.monotonic()
@@ -857,13 +859,17 @@ class ProviderRunner:
                 rows += 1
             if rows > self.row_limit:
                 raise ProviderError("provider capture failed")
+            succeeded = True
             return decoded
         finally:
             selector.close()
             process.stdout.close()
-            if process.poll() is None:
+            if not succeeded:
                 _kill_process_group(process)
-                process.wait()
+                try:
+                    process.wait()
+                except ChildProcessError:
+                    pass
 
 
 def expand_providers(
@@ -1322,6 +1328,7 @@ def build_view_model(
                 and entry.get("visible") is True
                 and entry.get("enabled") is True
                 and entry.get("disabled_state") is not True
+                and not entry.get("children")
             ):
                 public["actionToken"] = action_token(entry)
             public_entries[menu_id] = public
@@ -1352,7 +1359,11 @@ def validate_dispatch(
     entry = entries.get(menu_id)
     if entry is None:
         raise DispatchRejected("unknown")
-    if entry.get("kind") != "action" or entry.get("dispatch") is None:
+    if (
+        entry.get("kind") != "action"
+        or entry.get("dispatch") is None
+        or bool(entry.get("children"))
+    ):
         raise DispatchRejected("not-actionable")
     if not entry.get("visible", False):
         raise DispatchRejected("hidden")

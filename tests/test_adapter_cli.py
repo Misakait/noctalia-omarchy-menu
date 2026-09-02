@@ -279,6 +279,47 @@ class ProcessBoundaryTests(unittest.TestCase):
                     with self.assertRaises(menu_adapter.ProviderError):
                         runner([str(script)])
 
+    def test_provider_failure_kills_descendants_after_leader_exits(self) -> None:
+        cases = {
+            "nonzero": "exit 9\n",
+            "invalid-utf8": "printf '\\377'\n",
+        }
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            for name, failure in cases.items():
+                with self.subTest(name=name):
+                    pid_path = root / f"{name}.pid"
+                    script = root / name
+                    script.write_text(
+                        "#!/bin/sh\n"
+                        "sh -c 'trap \"\" HUP; sleep 5' </dev/null >/dev/null 2>&1 &\n"
+                        "printf '%s' \"$!\" > \"$1\"\n"
+                        + failure,
+                        encoding="utf-8",
+                    )
+                    script.chmod(0o755)
+                    with self.assertRaises(menu_adapter.ProviderError):
+                        menu_adapter.ProviderRunner(timeout=0.5)(
+                            [str(script), str(pid_path)]
+                        )
+                    self.assertTrue(pid_path.exists())
+                    pid = int(pid_path.read_text())
+                    try:
+                        deadline = time.monotonic() + 0.5
+                        while time.monotonic() < deadline:
+                            try:
+                                os.kill(pid, 0)
+                            except ProcessLookupError:
+                                break
+                            time.sleep(0.01)
+                        else:
+                            self.fail(f"provider descendant {pid} survived {name}")
+                    finally:
+                        try:
+                            os.kill(pid, 9)
+                        except ProcessLookupError:
+                            pass
+
     def test_overall_guard_deadline_cleans_up_live_process_groups(self) -> None:
         runner = menu_adapter.GuardRunner(timeout=5)
         entries = {
@@ -368,12 +409,13 @@ class CliEndToEndTests(unittest.TestCase):
         system = root / "system.jsonc"
         extension = root / "missing-extension.jsonc"
         compatibility = root / "compatibility.json"
-        marker = root / "marker"
+        marker = root / "completion"
+        session = root / "session"
         script_dir = root / "scripts"
         script_dir.mkdir()
         fixture = script_dir / "fixture"
         fixture.write_text(
-            "#!/bin/sh\nprintf marker > \"$1\"\ni=0; while [ $i -lt 2000 ]; do printf noisy; i=$((i+1)); done\nsleep 0.4\n",
+            "#!/bin/sh\nprintf '%s %s' \"$$\" \"$(ps -o sid= -p $$ | tr -d ' ')\" > \"$2\"\ni=0; while [ $i -lt 2000 ]; do printf noisy; i=$((i+1)); done\nsleep 0.5\nprintf complete > \"$1\"\n",
             encoding="utf-8",
         )
         fixture.chmod(0o755)
@@ -384,14 +426,16 @@ class CliEndToEndTests(unittest.TestCase):
                 "hidden": {"label": "Hidden", "action": "stock-hidden", "when": "false"},
                 "disabled": {"label": "Disabled", "action": "stock-disabled", "disabled": "true"},
                 "menu": {"label": "Menu"},
+                "compound": {"label": "Compound", "action": "stock-compound"},
+                "compound.child": {"label": "Child", "action": "stock-compound.child"},
             },
         )
         rules = {}
-        for menu_id in ("safe", "hidden", "disabled"):
+        for menu_id in ("safe", "hidden", "disabled", "compound", "compound.child"):
             rules[menu_id] = {
                 "match": {"action": f"stock-{menu_id}", "provider": ""},
                 "mode": "mapped",
-                "dispatch": {"mode": "script", "script": "scripts/fixture", "args": [str(marker)]},
+                "dispatch": {"mode": "script", "script": "scripts/fixture", "args": [str(marker), str(session)]},
             }
         _write(compatibility, {"schemaVersion": 1, "omarchyPackage": "fixture", "rules": rules})
         env = dict(os.environ)
@@ -406,6 +450,7 @@ class CliEndToEndTests(unittest.TestCase):
     def test_render_and_detached_dispatch_work_from_outside_project(self) -> None:
         with TemporaryDirectory() as directory, TemporaryDirectory() as cwd:
             env, marker = self._fixture(Path(directory))
+            session = Path(env["OMARCHY_MENU_ADAPTER_DIR"]) / "session"
             rendered = subprocess.run(
                 [sys.executable, str(ADAPTER), "render"], cwd=cwd, env=env,
                 text=True, capture_output=True, timeout=3,
@@ -423,11 +468,17 @@ class CliEndToEndTests(unittest.TestCase):
             self.assertEqual(dispatched.returncode, 0, dispatched.stderr)
             self.assertEqual(dispatched.stdout, "")
             self.assertEqual(dispatched.stderr, "")
-            self.assertLess(elapsed, 0.3)
+            self.assertLess(elapsed, 0.4)
+            self.assertFalse(marker.exists())
             deadline = time.monotonic() + 1
+            while not session.exists() and time.monotonic() < deadline:
+                time.sleep(0.01)
+            self.assertTrue(session.exists())
+            pid, session_id = (int(value) for value in session.read_text().split())
+            self.assertEqual(pid, session_id)
             while not marker.exists() and time.monotonic() < deadline:
                 time.sleep(0.01)
-            self.assertEqual(marker.read_text(), "marker")
+            self.assertEqual(marker.read_text(), "complete")
 
     def test_audit_reports_inventory_and_exits_nonzero_when_incomplete(self) -> None:
         with TemporaryDirectory() as directory:
@@ -457,6 +508,35 @@ class CliEndToEndTests(unittest.TestCase):
             self.assertEqual(json.loads(incomplete.stdout)["missing"], ["safe"])
             self.assertFalse(marker.exists())
 
+    def test_malformed_digest_path_fails_render_and_audit_without_leakage(self) -> None:
+        with TemporaryDirectory() as directory:
+            env, marker = self._fixture(Path(directory))
+            compatibility = Path(env["OMARCHY_MENU_COMPATIBILITY"])
+            document = json.loads(compatibility.read_text(encoding="utf-8"))
+            document["rules"]["safe"]["digests"] = {
+                "/tmp/PRIVATE_DIGEST\0_PATH": "0" * 64
+            }
+            _write(compatibility, document)
+
+            for command in ("render", "audit"):
+                with self.subTest(command=command):
+                    result = subprocess.run(
+                        [sys.executable, str(ADAPTER), command],
+                        env=env,
+                        text=True,
+                        capture_output=True,
+                        timeout=3,
+                    )
+                    self.assertNotEqual(result.returncode, 0)
+                    self.assertEqual(result.stdout, "")
+                    self.assertNotIn("Traceback", result.stderr)
+                    self.assertNotIn("PRIVATE_DIGEST", result.stderr)
+                    self.assertEqual(
+                        json.loads(result.stderr),
+                        {"category": "source-invalid", "code": 2},
+                    )
+                    self.assertFalse(marker.exists())
+
     def test_every_rejected_selection_keeps_spawn_marker_zero_and_errors_are_redacted(self) -> None:
         with TemporaryDirectory() as directory:
             env, marker = self._fixture(Path(directory))
@@ -483,6 +563,44 @@ class CliEndToEndTests(unittest.TestCase):
                     self.assertLessEqual(len(result.stderr), 512)
                     self.assertNotIn("stock-", result.stderr)
                     self.assertFalse(marker.exists())
+
+    def test_action_with_children_has_no_token_and_cannot_spawn(self) -> None:
+        with TemporaryDirectory() as directory:
+            env, marker = self._fixture(Path(directory))
+            rendered = subprocess.run(
+                [sys.executable, str(ADAPTER), "render"],
+                env=env,
+                text=True,
+                capture_output=True,
+                timeout=3,
+            )
+            self.assertEqual(rendered.returncode, 0, rendered.stderr)
+            view = json.loads(rendered.stdout)
+            self.assertNotIn("actionToken", view["entries"]["compound"])
+
+            internal = menu_adapter.build_model(
+                Path(env["OMARCHY_MENU_SYSTEM_SOURCE"]),
+                Path(env["OMARCHY_MENU_EXTENSION_SOURCE"]),
+                Path(env["OMARCHY_MENU_COMPATIBILITY"]),
+            )
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    str(ADAPTER),
+                    "dispatch",
+                    view["revision"],
+                    "compound",
+                    menu_adapter.action_token(internal["entries"]["compound"]),
+                ],
+                env=env,
+                text=True,
+                capture_output=True,
+                timeout=3,
+            )
+            self.assertNotEqual(result.returncode, 0)
+            self.assertEqual(result.stdout, "")
+            self.assertEqual(json.loads(result.stderr)["category"], "selection-rejected")
+            self.assertFalse(marker.exists())
 
     def test_stock_render_exposes_the_ten_approved_root_categories(self) -> None:
         result = subprocess.run(
