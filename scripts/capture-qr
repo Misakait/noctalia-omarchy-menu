@@ -1,0 +1,13 @@
+#!/bin/bash
+set -o pipefail
+
+selection=$(slurp 2>/dev/null) || exit 0
+[[ -z $selection ]] && exit 0
+
+result=$(
+  grim -g "$selection" - |
+    zbarimg -q --raw -Sdisable -Sqrcode.enable - 2>/dev/null
+) || exit 1
+
+[[ -z $result ]] && exit 1
+printf '%s' "$result" | wl-copy --sensitive

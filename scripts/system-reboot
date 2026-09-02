@@ -1,0 +1,5 @@
+#!/bin/bash
+
+systemd-run --user --collect --quiet --on-active=2s \
+  --timer-property=AccuracySec=100ms systemctl reboot --no-wall || exit 1
+niri msg action quit --skip-confirmation

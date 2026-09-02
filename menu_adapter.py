@@ -3,9 +3,10 @@
 
 from __future__ import annotations
 
-import json
 import hashlib
+import json
 import re
+import shutil
 import time
 from concurrent.futures import Future, ThreadPoolExecutor, wait
 from copy import deepcopy
@@ -172,6 +173,66 @@ def merge_sources(
     return merged
 
 
+def audit_inventory(
+    source: dict[str, dict[str, object]],
+    compatibility: dict[str, object],
+) -> dict[str, object]:
+    """Compare stock signatures to the inventory without evaluating or dispatching."""
+
+    raw_rules = compatibility.get("rules")
+    rules = raw_rules if isinstance(raw_rules, dict) else {}
+    stock = {
+        menu_id: fields
+        for menu_id, fields in source.items()
+        if _string(fields.get("action")) or _string(fields.get("provider"))
+    }
+    allowed_modes = ("pass-through", "mapped", "provider", "disabled")
+    counts = {mode: 0 for mode in allowed_modes}
+    missing: list[str] = []
+    signature_mismatches: list[str] = []
+    invalid_classifications: list[str] = []
+    digest_mismatches: list[str] = []
+
+    for menu_id, fields in stock.items():
+        rule = rules.get(menu_id)
+        if not isinstance(rule, dict):
+            missing.append(menu_id)
+            continue
+        mode = _string(rule.get("mode"))
+        if mode not in counts:
+            invalid_classifications.append(menu_id)
+            continue
+        counts[mode] += 1
+        expected_action, expected_provider = _expected_signature(rule)
+        if (
+            expected_action != _string(fields.get("action"))
+            or expected_provider != _string(fields.get("provider"))
+        ):
+            signature_mismatches.append(menu_id)
+        if rule_digest_mismatches(rule):
+            digest_mismatches.append(menu_id)
+
+    extra = sorted(set(rules) - set(stock))
+    problems = (
+        missing
+        + signature_mismatches
+        + invalid_classifications
+        + digest_mismatches
+        + extra
+    )
+    return {
+        "ok": not problems,
+        "stockRows": len(stock),
+        "counts": counts,
+        "missing": sorted(missing),
+        "signatureMismatches": sorted(signature_mismatches),
+        "invalidClassifications": sorted(invalid_classifications),
+        "digestMismatches": sorted(digest_mismatches),
+        "extra": extra,
+        "omarchyPackage": _string(compatibility.get("omarchyPackage")),
+    }
+
+
 def _string(value: object) -> str:
     return value if isinstance(value, str) else ""
 
@@ -268,8 +329,67 @@ def _obviously_incompatible(action: str) -> bool:
     return any(pattern.search(action) for pattern in _HYPRLAND_PATTERNS)
 
 
+def _file_sha256(path: Path) -> str | None:
+    try:
+        hasher = hashlib.sha256()
+        with path.open("rb") as handle:
+            for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                hasher.update(chunk)
+        return hasher.hexdigest()
+    except OSError:
+        return None
+
+
+def rule_digest_mismatches(rule: dict[str, object]) -> list[str]:
+    """Return audited helper paths whose content is missing or changed."""
+
+    digests = rule.get("digests")
+    if digests is None:
+        return []
+    if not isinstance(digests, dict):
+        return ["<invalid-digest-map>"]
+
+    mismatches: list[str] = []
+    for raw_path, expected in digests.items():
+        if not isinstance(raw_path, str) or not isinstance(expected, str):
+            mismatches.append("<invalid-digest-entry>")
+        elif _file_sha256(Path(raw_path)) != expected:
+            mismatches.append(raw_path)
+    return mismatches
+
+
 def _rule_dispatch(rule: dict[str, object], action: str) -> dict[str, object] | None:
     mode = _string(rule.get("mode"))
+    if mode == "mapped":
+        nested = rule.get("dispatch")
+        if not isinstance(nested, dict):
+            return None
+        nested_mode = _string(nested.get("mode"))
+        if nested_mode == "argv":
+            argv = nested.get("argv")
+            if isinstance(argv, list) and argv and all(
+                isinstance(value, str) for value in argv
+            ):
+                payload: dict[str, object] = {"mode": "argv", "argv": list(argv)}
+                env = nested.get("env")
+                if isinstance(env, dict) and all(
+                    isinstance(key, str) and isinstance(value, str)
+                    for key, value in env.items()
+                ):
+                    payload["env"] = dict(env)
+                return payload
+        if nested_mode == "script":
+            script = _string(nested.get("script"))
+            args = nested.get("args", [])
+            if script and isinstance(args, list) and all(
+                isinstance(value, str) for value in args
+            ):
+                return {"mode": "script", "script": script, "args": list(args)}
+        if nested_mode == "shell":
+            command = _string(nested.get("command"))
+            if command:
+                return {"mode": "shell", "command": command}
+        return None
     if mode in {"disable", "disabled"}:
         return None
     if mode in {"replace", "argv"}:
@@ -303,6 +423,7 @@ def resolve_compatibility(
     exact_rules: dict[str, dict[str, object]],
     *,
     source: str,
+    dependency_available: Callable[[str], bool] | None = None,
 ) -> dict[str, object]:
     """Resolve an entry before guards are evaluated.
 
@@ -336,6 +457,26 @@ def resolve_compatibility(
             if name in rule:
                 resolved["effective_guards"][name] = _string(rule.get(name))
         resolved["force_visible"] = bool(rule.get("force_visible", False))
+        if rule_digest_mismatches(rule):
+            resolved["compatibility_status"] = "disabled"
+            resolved["compatibility_disabled"] = True
+            resolved["force_visible"] = True
+            resolved["disabled_reason"] = "Compatibility not reviewed"
+            return resolved
+        requires = rule.get("requires", [])
+        checker = dependency_available or (
+            lambda name: shutil.which(name) is not None
+        )
+        if isinstance(requires, list) and all(
+            isinstance(name, str) and name for name in requires
+        ):
+            missing = next((name for name in requires if not checker(name)), "")
+            if missing:
+                resolved["compatibility_status"] = "disabled"
+                resolved["compatibility_disabled"] = True
+                resolved["force_visible"] = True
+                resolved["disabled_reason"] = f"Missing dependency: {missing}"
+                return resolved
         if mode in {"disable", "disabled"}:
             resolved["compatibility_status"] = "disabled"
             resolved["compatibility_disabled"] = True
@@ -357,6 +498,8 @@ def resolve_compatibility(
                 )
                 if payload is not None:
                     resolved["dispatch"] = payload
+                    if mode == "mapped" and provider:
+                        resolved["kind"] = "action"
         return resolved
 
     if _obviously_incompatible(action):
@@ -383,6 +526,84 @@ def resolve_compatibility(
         resolved["compatibility_status"] = "pass-through"
         resolved["dispatch"] = {"mode": "shell", "command": action}
     return resolved
+
+
+def expand_providers(
+    entries: dict[str, dict[str, object]],
+    runner: Callable[[list[str]], str],
+) -> dict[str, dict[str, object]]:
+    """Expand supported read-only providers without dispatching a selection."""
+
+    expanded = deepcopy(entries)
+    next_order = 1 + max(
+        (
+            int(entry.get("order", -1))
+            for entry in expanded.values()
+            if isinstance(entry.get("order"), int)
+        ),
+        default=-1,
+    )
+    for parent_id, parent in list(expanded.items()):
+        if parent.get("compatibility_status") != "provider":
+            continue
+        provider = _string(parent.get("provider"))
+        if provider != "fonts":
+            parent["compatibility_status"] = "disabled"
+            parent["compatibility_disabled"] = True
+            parent["force_visible"] = True
+            parent["disabled_reason"] = "Unsupported provider"
+            continue
+        try:
+            listed = runner(["omarchy-font-list"])
+            current = runner(["omarchy-font-current"]).strip()
+        except Exception:
+            parent["compatibility_status"] = "disabled"
+            parent["compatibility_disabled"] = True
+            parent["force_visible"] = True
+            parent["disabled_reason"] = "Provider unavailable: fonts"
+            continue
+
+        fonts = list(
+            dict.fromkeys(
+                value.strip()
+                for value in listed.splitlines()
+                if value.strip() and "\x00" not in value
+            )
+        )
+        for font in fonts:
+            suffix = hashlib.sha256(font.encode("utf-8")).hexdigest()[:24]
+            menu_id = f"{parent_id}.provider-{suffix}"
+            expanded[menu_id] = {
+                "id": menu_id,
+                "parent": parent_id,
+                "kind": "action",
+                "icon": _string(parent.get("icon")),
+                "iconFont": _string(parent.get("iconFont")),
+                "label": font,
+                "title": "",
+                "target": "",
+                "description": "",
+                "action": "",
+                "provider": "",
+                "aliases": [],
+                "when": "",
+                "checked": "",
+                "disabled": "",
+                "order": next_order,
+                "effective_guards": {"when": "", "checked": "", "disabled": ""},
+                "compatibility_status": "provider",
+                "compatibility_disabled": False,
+                "force_visible": False,
+                "disabled_reason": "",
+                "provider_checked": font == current,
+                "dispatch": {
+                    "mode": "script",
+                    "script": "scripts/font-set",
+                    "args": [font],
+                },
+            }
+            next_order += 1
+    return expanded
 
 
 def evaluate_guards(
@@ -471,7 +692,9 @@ def evaluate_guards(
             return results.get(expression, (False, False))
 
         when_value, _when_ok = guard("when", True)
-        checked_value, _checked_ok = guard("checked", False)
+        checked_value, _checked_ok = guard(
+            "checked", bool(entry.get("provider_checked", False))
+        )
         disabled_value, disabled_ok = guard("disabled", False)
         force_visible = bool(entry.get("force_visible", False))
         compatibility_disabled = bool(entry.get("compatibility_disabled", False))

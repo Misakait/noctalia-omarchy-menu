@@ -1,0 +1,116 @@
+#!/usr/bin/python3
+"""Set Omarchy's monospace font without starting Omarchy Shell."""
+
+from __future__ import annotations
+
+import os
+import re
+import shutil
+import subprocess
+import sys
+from pathlib import Path
+from xml.sax.saxutils import escape
+
+
+def replace_if_present(path: Path, pattern: str, replacement: str) -> bool:
+    if not path.is_file():
+        return False
+    original = path.read_text(encoding="utf-8")
+    updated = re.sub(pattern, lambda _match: replacement, original, flags=re.MULTILINE)
+    path.write_text(updated, encoding="utf-8")
+    return True
+
+
+def run_optional(argv: list[str]) -> None:
+    if shutil.which(argv[0]):
+        subprocess.run(
+            argv,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=False,
+        )
+
+
+def main() -> int:
+    if len(sys.argv) == 2 and sys.argv[1] in {"-h", "--help"}:
+        print("Usage: font-set <font-name>")
+        return 0
+    if len(sys.argv) != 2 or not sys.argv[1] or any(
+        char in sys.argv[1] for char in "\x00\r\n"
+    ):
+        print("Usage: font-set <font-name>", file=sys.stderr)
+        return 1
+
+    font_name = sys.argv[1]
+    available = subprocess.run(
+        ["fc-list"], text=True, capture_output=True, check=False
+    )
+    if (
+        available.returncode != 0
+        or font_name.casefold() not in available.stdout.casefold()
+    ):
+        print(f"Font {font_name!r} not found.", file=sys.stderr)
+        return 1
+
+    home = Path(os.environ.get("HOME", "")).expanduser()
+    toml_name = font_name.replace("\\", "\\\\").replace('"', '\\"')
+    replace_if_present(
+        home / ".config/alacritty/alacritty.toml",
+        r'family = ".*"',
+        f'family = "{toml_name}"',
+    )
+    if replace_if_present(
+        home / ".config/kitty/kitty.conf",
+        r"^font_family .*",
+        f"font_family {font_name}",
+    ):
+        run_optional(["pkill", "-USR1", "kitty"])
+    if replace_if_present(
+        home / ".config/ghostty/config",
+        r'^font-family = ".*"',
+        f'font-family = "{toml_name}"',
+    ):
+        run_optional(["pkill", "-SIGUSR2", "ghostty"])
+    replace_if_present(
+        home / ".config/foot/foot.ini",
+        r"^font=.*",
+        f"font={font_name}:size=9",
+    )
+
+    fontconfig_path = home / ".config/fontconfig/fonts.conf"
+    fontconfig_path.parent.mkdir(parents=True, exist_ok=True)
+    fontconfig_path.write_text(
+        "<?xml version=\"1.0\"?>\n"
+        "<!DOCTYPE fontconfig SYSTEM \"fonts.dtd\">\n"
+        "<fontconfig>\n"
+        "  <match target=\"pattern\">\n"
+        "    <test name=\"family\" qual=\"any\">\n"
+        "      <string>monospace</string>\n"
+        "    </test>\n"
+        "    <edit name=\"family\" mode=\"prepend_first\" binding=\"strong\">\n"
+        f"      <string>{escape(font_name)}</string>\n"
+        "    </edit>\n"
+        "  </match>\n"
+        "</fontconfig>\n",
+        encoding="utf-8",
+    )
+
+    for terminal, message in (
+        ("ghostty", "You must restart Ghostty to see font change"),
+        ("foot", "You must restart Foot to see font change"),
+    ):
+        if shutil.which("pgrep") and subprocess.run(
+            ["pgrep", "-x", terminal],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=False,
+        ).returncode == 0:
+            run_optional(["omarchy-notification-send", "-g", "", message])
+    run_optional(["omarchy-hook", "font-set", font_name])
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
