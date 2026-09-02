@@ -5,8 +5,14 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import re
+import selectors
 import shutil
+import signal
+import subprocess
+import sys
+import threading
 import time
 from concurrent.futures import Future, ThreadPoolExecutor, wait
 from copy import deepcopy
@@ -28,6 +34,35 @@ class DispatchRejected(ValueError):
 
 class GuardDeadlineExceeded(RuntimeError):
     """The guard batch exceeded its deadline, so its model is unsafe to use."""
+
+
+class ProviderError(RuntimeError):
+    """A provider failed its bounded, atomic capture."""
+
+
+class ActionUnavailable(RuntimeError):
+    """A validated selection does not resolve to a safe executable payload."""
+
+
+class ActionStartError(RuntimeError):
+    """The operating system rejected a fully validated action spawn."""
+
+
+_SAFE_ID = re.compile(r"[A-Za-z0-9_.:-]+\Z")
+_HEX_DIGEST = re.compile(r"[0-9a-f]{64}\Z")
+_ADAPTER_DIR = Path(__file__).resolve().parent
+_SYSTEM_SOURCE = Path("/usr/share/omarchy/default/omarchy/omarchy-menu.jsonc")
+_EXTENSION_SOURCE = Path.home() / ".config/omarchy/extensions/omarchy-menu.jsonc"
+_COMPATIBILITY_SOURCE = _ADAPTER_DIR / "compatibility.json"
+
+
+def _no_duplicates(pairs: list[tuple[str, object]]) -> dict[str, object]:
+    result: dict[str, object] = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError("duplicate object key")
+        result[key] = value
+    return result
 
 
 def _strip_jsonc_comments(document: str) -> str:
@@ -64,13 +99,17 @@ def _strip_jsonc_comments(document: str) -> str:
         elif char == "/" and next_char == "*":
             output.extend("  ")
             index += 2
+            terminated = False
             while index < len(document):
                 if index + 1 < len(document) and document[index : index + 2] == "*/":
                     output.extend("  ")
                     index += 2
+                    terminated = True
                     break
                 output.append(document[index] if document[index] in "\r\n" else " ")
                 index += 1
+            if not terminated:
+                raise ValueError("unterminated block comment")
         else:
             output.append(char)
             index += 1
@@ -121,7 +160,10 @@ def _strip_trailing_commas(document: str) -> str:
 
 
 def parse_jsonc(document: str) -> object:
-    return json.loads(_strip_trailing_commas(_strip_jsonc_comments(document)))
+    return json.loads(
+        _strip_trailing_commas(_strip_jsonc_comments(document)),
+        object_pairs_hook=_no_duplicates,
+    )
 
 
 def load_source(path: Path, *, required: bool = True) -> dict[str, dict[str, object]]:
@@ -132,15 +174,17 @@ def load_source(path: Path, *, required: bool = True) -> dict[str, dict[str, obj
 
     try:
         document = path.read_text(encoding="utf-8")
-    except OSError as exc:
+    except (OSError, UnicodeError) as exc:
         raise SourceError(f"Unable to read menu source {path}: {exc}") from exc
 
     try:
         parsed = parse_jsonc(document)
-    except json.JSONDecodeError as exc:
+    except (json.JSONDecodeError, ValueError) as exc:
+        line = getattr(exc, "lineno", 1)
+        column = getattr(exc, "colno", 1)
+        message = getattr(exc, "msg", str(exc))
         raise SourceError(
-            f"Invalid JSONC in {path} at line {exc.lineno}, column {exc.colno}: "
-            f"{exc.msg}"
+            f"Invalid JSONC in {path} at line {line}, column {column}: {message}"
         ) from exc
 
     if not isinstance(parsed, dict):
@@ -156,8 +200,146 @@ def load_source(path: Path, *, required: bool = True) -> dict[str, dict[str, obj
             raise SourceError(
                 f"Menu source {path} entries must map string IDs to objects"
             )
+        if not menu_id or menu_id == "root" or not _SAFE_ID.fullmatch(menu_id):
+            raise SourceError(f"Menu source {path} contains an invalid entry ID")
+        for field in ("action", "provider", "when", "checked", "disabled"):
+            if field in fields and not isinstance(fields[field], str):
+                raise SourceError(
+                    f"Menu source {path} entry {menu_id!r} field {field!r} must be a string"
+                )
         normalized[menu_id] = dict(fields)
     return normalized
+
+
+def _valid_string_list(value: object, *, nonempty: bool = False) -> bool:
+    return (
+        isinstance(value, list)
+        and (not nonempty or bool(value))
+        and all(isinstance(item, str) and "\0" not in item for item in value)
+    )
+
+
+def _validate_dispatch_document(payload: object) -> None:
+    if not isinstance(payload, dict):
+        raise SourceError("Compatibility dispatch must be an object")
+    mode = payload.get("mode")
+    if mode == "argv":
+        if set(payload) - {"mode", "argv", "env"} or not _valid_string_list(
+            payload.get("argv"), nonempty=True
+        ):
+            raise SourceError("Compatibility argv dispatch is malformed")
+        env = payload.get("env", {})
+        if not isinstance(env, dict) or not all(
+            isinstance(key, str)
+            and bool(key)
+            and "\0" not in key
+            and "=" not in key
+            and isinstance(value, str)
+            and "\0" not in value
+            for key, value in env.items()
+        ):
+            raise SourceError("Compatibility dispatch environment is malformed")
+    elif mode == "script":
+        script = payload.get("script")
+        if (
+            set(payload) - {"mode", "script", "args"}
+            or not isinstance(script, str)
+            or not script
+            or "\0" in script
+            or Path(script).is_absolute()
+            or not _valid_string_list(payload.get("args", []))
+        ):
+            raise SourceError("Compatibility script dispatch is malformed")
+    elif mode == "shell":
+        command = payload.get("command")
+        if (
+            set(payload) != {"mode", "command"}
+            or not isinstance(command, str)
+            or not command
+            or "\0" in command
+        ):
+            raise SourceError("Compatibility shell dispatch is malformed")
+    else:
+        raise SourceError("Compatibility dispatch mode is unknown")
+
+
+def _validate_compatibility(document: object) -> dict[str, object]:
+    if not isinstance(document, dict):
+        raise SourceError("Compatibility document must contain an object")
+    if type(document.get("schemaVersion")) is not int or document["schemaVersion"] != 1:
+        raise SourceError("Compatibility schema version is unsupported")
+    if not isinstance(document.get("omarchyPackage", ""), str):
+        raise SourceError("Compatibility package must be a string")
+    rules = document.get("rules")
+    if not isinstance(rules, dict):
+        raise SourceError("Compatibility rules must contain an object")
+    for menu_id, rule in rules.items():
+        if (
+            not isinstance(menu_id, str)
+            or not menu_id
+            or menu_id == "root"
+            or not _SAFE_ID.fullmatch(menu_id)
+            or not isinstance(rule, dict)
+        ):
+            raise SourceError("Compatibility contains an invalid rule")
+        allowed_rule_fields = {
+            "match",
+            "mode",
+            "dispatch",
+            "requires",
+            "digests",
+            "when",
+            "checked",
+            "disabled",
+            "reason",
+            "force_visible",
+        }
+        if set(rule) - allowed_rule_fields:
+            raise SourceError("Compatibility rule contains unknown security fields")
+        match = rule.get("match")
+        if (
+            not isinstance(match, dict)
+            or set(match) != {"action", "provider"}
+            or not all(isinstance(match.get(name), str) for name in ("action", "provider"))
+            or any("\0" in str(match[name]) for name in ("action", "provider"))
+        ):
+            raise SourceError("Compatibility match is malformed")
+        mode = rule.get("mode")
+        if mode not in {"pass-through", "mapped", "provider", "disabled"}:
+            raise SourceError("Compatibility mode is unknown")
+        if mode == "mapped":
+            _validate_dispatch_document(rule.get("dispatch"))
+        elif "dispatch" in rule:
+            raise SourceError("Compatibility dispatch is invalid for its mode")
+        for field in ("when", "checked", "disabled", "reason"):
+            if field in rule and not isinstance(rule[field], str):
+                raise SourceError("Compatibility guard or reason is malformed")
+        if "force_visible" in rule and not isinstance(rule["force_visible"], bool):
+            raise SourceError("Compatibility force_visible is malformed")
+        requires = rule.get("requires", [])
+        if not _valid_string_list(requires) or any(not item for item in requires):
+            raise SourceError("Compatibility requires is malformed")
+        digests = rule.get("digests", {})
+        if not isinstance(digests, dict) or not all(
+            isinstance(path, str)
+            and Path(path).is_absolute()
+            and isinstance(digest, str)
+            and bool(_HEX_DIGEST.fullmatch(digest))
+            for path, digest in digests.items()
+        ):
+            raise SourceError("Compatibility digests are malformed")
+    return deepcopy(document)
+
+
+def load_compatibility(path: Path) -> dict[str, object]:
+    if not path.exists():
+        raise SourceError(f"Compatibility source does not exist: {path}")
+    try:
+        text = path.read_text(encoding="utf-8")
+        document = json.loads(text, object_pairs_hook=_no_duplicates)
+    except (OSError, UnicodeError, json.JSONDecodeError, ValueError) as exc:
+        raise SourceError(f"Invalid compatibility source: {path}") from exc
+    return _validate_compatibility(document)
 
 
 def merge_sources(
@@ -532,9 +714,163 @@ def resolve_compatibility(
     return resolved
 
 
+def _kill_process_group(process: subprocess.Popen[object]) -> None:
+    try:
+        os.killpg(process.pid, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
+
+
+class GuardRunner:
+    """Run trusted guard expressions with bounded lifetime and group cleanup."""
+
+    def __init__(self, timeout: float = 1.5):
+        self.timeout = timeout
+        self._lock = threading.Lock()
+        self._processes: set[subprocess.Popen[object]] = set()
+        self._cancelled = threading.Event()
+
+    @property
+    def active_count(self) -> int:
+        with self._lock:
+            return len(self._processes)
+
+    def __call__(self, expression: str) -> bool:
+        if self._cancelled.is_set():
+            return False
+        process = subprocess.Popen(
+            ["bash", "-lc", expression],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+            close_fds=True,
+        )
+        with self._lock:
+            self._processes.add(process)
+        if self._cancelled.is_set():
+            _kill_process_group(process)
+        try:
+            try:
+                return process.wait(timeout=self.timeout) == 0
+            except subprocess.TimeoutExpired:
+                _kill_process_group(process)
+                process.wait()
+                return False
+        finally:
+            with self._lock:
+                self._processes.discard(process)
+
+    def cancel_all(self) -> None:
+        self._cancelled.set()
+        with self._lock:
+            processes = tuple(self._processes)
+        for process in processes:
+            _kill_process_group(process)
+        for process in processes:
+            try:
+                process.wait()
+            except ChildProcessError:
+                pass
+
+
+class ProviderRunner:
+    """Capture provider stdout as strict, bounded UTF-8."""
+
+    def __init__(
+        self,
+        timeout: float = 1.5,
+        byte_limit: int = 256 * 1024,
+        line_limit: int = 4096,
+        row_limit: int = 2048,
+    ):
+        self.timeout = timeout
+        self.byte_limit = byte_limit
+        self.line_limit = line_limit
+        self.row_limit = row_limit
+
+    def __call__(self, argv: list[str]) -> str:
+        process = subprocess.Popen(
+            argv,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+            close_fds=True,
+        )
+        assert process.stdout is not None
+        os.set_blocking(process.stdout.fileno(), False)
+        selector = selectors.DefaultSelector()
+        selector.register(process.stdout, selectors.EVENT_READ)
+        deadline = time.monotonic() + self.timeout
+        output = bytearray()
+        current_line = 0
+        rows = 0
+        failed = False
+        try:
+            while selector.get_map():
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    failed = True
+                    break
+                events = selector.select(remaining)
+                if not events:
+                    failed = True
+                    break
+                for key, _mask in events:
+                    chunk = os.read(key.fd, 65536)
+                    if not chunk:
+                        selector.unregister(key.fileobj)
+                        continue
+                    output.extend(chunk)
+                    if len(output) > self.byte_limit or b"\0" in chunk:
+                        failed = True
+                        break
+                    for byte in chunk:
+                        if byte == 10:
+                            rows += 1
+                            current_line = 0
+                        else:
+                            current_line += 1
+                        if current_line > self.line_limit or rows > self.row_limit:
+                            failed = True
+                            break
+                    if failed:
+                        break
+                if failed:
+                    break
+            if failed:
+                _kill_process_group(process)
+            try:
+                returncode = process.wait(timeout=max(0.0, deadline - time.monotonic()))
+            except subprocess.TimeoutExpired:
+                _kill_process_group(process)
+                process.wait()
+                failed = True
+            if failed or returncode != 0:
+                raise ProviderError("provider capture failed")
+            try:
+                decoded = output.decode("utf-8", errors="strict")
+            except UnicodeDecodeError as exc:
+                raise ProviderError("provider capture failed") from exc
+            if decoded and not decoded.endswith("\n"):
+                rows += 1
+            if rows > self.row_limit:
+                raise ProviderError("provider capture failed")
+            return decoded
+        finally:
+            selector.close()
+            process.stdout.close()
+            if process.poll() is None:
+                _kill_process_group(process)
+                process.wait()
+
+
 def expand_providers(
     entries: dict[str, dict[str, object]],
     runner: Callable[[list[str]], str],
+    *,
+    warnings: list[str] | None = None,
 ) -> dict[str, dict[str, object]]:
     """Expand supported read-only providers without dispatching a selection."""
 
@@ -565,6 +901,8 @@ def expand_providers(
             parent["compatibility_disabled"] = True
             parent["force_visible"] = True
             parent["disabled_reason"] = "Provider unavailable: fonts"
+            if warnings is not None:
+                warnings.append("Provider unavailable: fonts")
             continue
 
         fonts = list(
@@ -639,19 +977,28 @@ def evaluate_guards(
     started = time.monotonic()
     overall_deadline = started + max(0.0, overall_timeout)
     guard_timeout = max(0.0, per_guard_timeout)
-    futures = {
-        executor.submit(runner, expression): (expression, time.monotonic())
-        for expression in expressions
-    }
+    started_at: dict[str, float] = {}
+    start_lock = threading.Lock()
+
+    def run(expression: str) -> bool:
+        with start_lock:
+            started_at[expression] = time.monotonic()
+        return runner(expression)
+
+    futures = {executor.submit(run, expression): expression for expression in expressions}
     pending = set(futures)
 
     def deadline_for(future: Future[bool]) -> float:
-        _expression, submitted = futures[future]
-        return min(submitted + guard_timeout, overall_deadline)
+        expression = futures[future]
+        with start_lock:
+            expression_started = started_at.get(expression)
+        if expression_started is None:
+            return overall_deadline
+        return min(expression_started + guard_timeout, overall_deadline)
 
     def record_completed(done: set[Future[bool]]) -> None:
         for future in done:
-            expression, _submitted = futures[future]
+            expression = futures[future]
             try:
                 results[expression] = (bool(future.result(timeout=0)), True)
             except Exception:
@@ -667,12 +1014,17 @@ def evaluate_guards(
         if now >= overall_deadline:
             for future in pending:
                 future.cancel()
-            executor.shutdown(wait=False, cancel_futures=True)
+            cancel_all = getattr(runner, "cancel_all", None)
+            if callable(cancel_all):
+                cancel_all()
+                executor.shutdown(wait=True, cancel_futures=True)
+            else:
+                executor.shutdown(wait=False, cancel_futures=True)
             raise GuardDeadlineExceeded("overall guard deadline exceeded")
 
         for future in tuple(pending):
-            expression, submitted = futures[future]
             if now >= deadline_for(future):
+                expression = futures[future]
                 results[expression] = (False, False)
                 future.cancel()
                 pending.remove(future)
@@ -920,7 +1272,12 @@ def action_token(entry: dict[str, object]) -> str:
     )
 
 
-def build_view_model(tree: dict[str, object], revision: str) -> dict[str, object]:
+def build_view_model(
+    tree: dict[str, object],
+    revision: str,
+    *,
+    source: dict[str, object] | None = None,
+) -> dict[str, object]:
     entries = tree.get("entries", {})
     public_entries: dict[str, dict[str, object]] = {}
     allowed = (
@@ -958,7 +1315,14 @@ def build_view_model(tree: dict[str, object], revision: str) -> dict[str, object
                 "compatibility_status", "neutral"
             )
             public["disabledReason"] = public.pop("disabled_reason", "")
-            if entry.get("dispatch") is not None and entry.get("kind") == "action":
+            public["searchText"] = public.pop("search_text", "")
+            if (
+                entry.get("dispatch") is not None
+                and entry.get("kind") == "action"
+                and entry.get("visible") is True
+                and entry.get("enabled") is True
+                and entry.get("disabled_state") is not True
+            ):
                 public["actionToken"] = action_token(entry)
             public_entries[menu_id] = public
 
@@ -968,6 +1332,10 @@ def build_view_model(tree: dict[str, object], revision: str) -> dict[str, object
         "root": tree.get("root", "root"),
         "entries": public_entries,
         "warnings": list(tree.get("warnings", [])),
+        "source": {
+            "omarchyPackage": _string((source or {}).get("omarchyPackage")),
+            "extensionLoaded": bool((source or {}).get("extensionLoaded", False)),
+        },
     }
 
 
@@ -993,3 +1361,275 @@ def validate_dispatch(
     if requested_token != action_token(entry):
         raise DispatchRejected("stale")
     return deepcopy(entry["dispatch"])
+
+
+def build_model(
+    system_path: Path = _SYSTEM_SOURCE,
+    extension_path: Path = _EXTENSION_SOURCE,
+    compatibility_path: Path = _COMPATIBILITY_SOURCE,
+    *,
+    guard_runner: Callable[[str], bool] | None = None,
+    provider_runner: Callable[[list[str]], str] | None = None,
+    dependency_available: Callable[[str], bool] | None = None,
+) -> dict[str, object]:
+    """Rebuild one complete internal and public model from current inputs."""
+
+    system = load_source(system_path)
+    extension_loaded = extension_path.exists()
+    extension = load_source(extension_path, required=False)
+    compatibility = load_compatibility(compatibility_path)
+    merged = merge_sources(system, extension)
+    revision = compute_revision(merged, compatibility)
+    normalized = normalize_menu(merged)
+    raw_rules = compatibility["rules"]
+    assert isinstance(raw_rules, dict)
+    rules = {
+        menu_id: rule
+        for menu_id, rule in raw_rules.items()
+        if isinstance(menu_id, str) and isinstance(rule, dict)
+    }
+
+    resolved: dict[str, dict[str, object]] = {}
+    for menu_id, entry in normalized.items():
+        owner = "system"
+        if menu_id != "root" and menu_id in extension:
+            if menu_id not in system:
+                owner = "extension"
+            else:
+                old_signature = (
+                    _string(system[menu_id].get("action")),
+                    _string(system[menu_id].get("provider")),
+                )
+                new_signature = (
+                    _string(merged[menu_id].get("action")),
+                    _string(merged[menu_id].get("provider")),
+                )
+                if new_signature != old_signature:
+                    owner = "extension"
+        resolved[menu_id] = resolve_compatibility(
+            entry,
+            rules,
+            source=owner,
+            dependency_available=dependency_available,
+        )
+
+    provider_warnings: list[str] = []
+    expanded = expand_providers(
+        resolved,
+        provider_runner or ProviderRunner(),
+        warnings=provider_warnings,
+    )
+    guarded, guard_warnings = evaluate_guards(
+        expanded,
+        guard_runner or GuardRunner(),
+    )
+    tree = finalize_tree(guarded)
+    tree_warnings = tree.get("warnings")
+    combined = provider_warnings + guard_warnings
+    if isinstance(tree_warnings, list):
+        combined.extend(value for value in tree_warnings if isinstance(value, str))
+    tree["warnings"] = combined
+    source = {
+        "omarchyPackage": _string(compatibility.get("omarchyPackage")),
+        "extensionLoaded": extension_loaded,
+    }
+    view = build_view_model(tree, revision, source=source)
+    return {
+        "revision": revision,
+        "entries": tree["entries"],
+        "tree": tree,
+        "view": view,
+        "source": source,
+        "system": system,
+        "compatibility": compatibility,
+    }
+
+
+def _validated_execution(
+    payload: object,
+    adapter_dir: Path,
+) -> tuple[list[str], dict[str, str]]:
+    if not isinstance(payload, dict):
+        raise ActionUnavailable("invalid payload")
+    mode = payload.get("mode")
+    env_mapping = payload.get("env", {})
+    if not isinstance(env_mapping, dict) or not all(
+        isinstance(key, str)
+        and bool(key)
+        and "\0" not in key
+        and "=" not in key
+        and isinstance(value, str)
+        and "\0" not in value
+        for key, value in env_mapping.items()
+    ):
+        raise ActionUnavailable("invalid payload")
+
+    if mode == "argv":
+        if set(payload) - {"mode", "argv", "env"}:
+            raise ActionUnavailable("invalid payload")
+        argv = payload.get("argv")
+        if not _valid_string_list(argv, nonempty=True):
+            raise ActionUnavailable("invalid payload")
+        assert isinstance(argv, list)
+        command = argv[0]
+        if not command or shutil.which(command) is None:
+            raise ActionUnavailable("command unavailable")
+        resolved_argv = list(argv)
+    elif mode == "shell":
+        if set(payload) != {"mode", "command"}:
+            raise ActionUnavailable("invalid payload")
+        command = payload.get("command")
+        if not isinstance(command, str) or not command or "\0" in command:
+            raise ActionUnavailable("invalid payload")
+        bash = shutil.which("bash")
+        if bash is None:
+            raise ActionUnavailable("command unavailable")
+        resolved_argv = [bash, "-lc", command]
+    elif mode == "script":
+        if set(payload) - {"mode", "script", "args"}:
+            raise ActionUnavailable("invalid payload")
+        script = payload.get("script")
+        args = payload.get("args", [])
+        if (
+            not isinstance(script, str)
+            or not script
+            or "\0" in script
+            or Path(script).is_absolute()
+            or not _valid_string_list(args)
+        ):
+            raise ActionUnavailable("invalid payload")
+        base = adapter_dir.resolve()
+        try:
+            resolved = (base / script).resolve(strict=True)
+        except OSError as exc:
+            raise ActionUnavailable("script unavailable") from exc
+        if (
+            not resolved.is_relative_to(base)
+            or not resolved.is_file()
+            or not os.access(resolved, os.X_OK)
+        ):
+            raise ActionUnavailable("script unavailable")
+        assert isinstance(args, list)
+        resolved_argv = [str(resolved), *args]
+    else:
+        raise ActionUnavailable("invalid payload")
+    environment = os.environ.copy()
+    environment.update(env_mapping)
+    return resolved_argv, environment
+
+
+def execute_payload(
+    payload: object,
+    *,
+    adapter_dir: Path = _ADAPTER_DIR,
+    popen: Callable[..., object] = subprocess.Popen,
+) -> None:
+    argv, environment = _validated_execution(payload, adapter_dir)
+    try:
+        popen(
+            argv,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+            close_fds=True,
+            env=environment,
+        )
+    except Exception as exc:
+        raise ActionStartError("action start failed") from exc
+
+
+_EXIT_CODES = {
+    "source-invalid": 2,
+    "state-unavailable": 3,
+    "stale-selection": 4,
+    "selection-rejected": 5,
+    "action-unavailable": 6,
+    "start-failure": 7,
+    "inventory-incomplete": 1,
+    "invalid-invocation": 64,
+}
+
+
+def _safe_reported_id(value: str | None) -> str | None:
+    if value and len(value) <= 128 and _SAFE_ID.fullmatch(value):
+        return value
+    return None
+
+
+def _write_error(category: str, menu_id: str | None = None) -> int:
+    code = _EXIT_CODES[category]
+    record: dict[str, object] = {"category": category, "code": code}
+    safe_id = _safe_reported_id(menu_id)
+    if safe_id is not None:
+        record["id"] = safe_id
+    sys.stderr.write(json.dumps(record, sort_keys=True, separators=(",", ":")) + "\n")
+    return code
+
+
+def _runtime_paths(environment: dict[str, str]) -> tuple[Path, Path, Path, Path]:
+    return (
+        Path(environment.get("OMARCHY_MENU_SYSTEM_SOURCE", str(_SYSTEM_SOURCE))),
+        Path(environment.get("OMARCHY_MENU_EXTENSION_SOURCE", str(_EXTENSION_SOURCE))),
+        Path(environment.get("OMARCHY_MENU_COMPATIBILITY", str(_COMPATIBILITY_SOURCE))),
+        Path(environment.get("OMARCHY_MENU_ADAPTER_DIR", str(_ADAPTER_DIR))),
+    )
+
+
+def main(argv: list[str] | None = None, environment: dict[str, str] | None = None) -> int:
+    arguments = list(sys.argv[1:] if argv is None else argv)
+    environ = dict(os.environ if environment is None else environment)
+    system_path, extension_path, compatibility_path, adapter_dir = _runtime_paths(environ)
+    command = arguments[0] if arguments else ""
+    menu_id = arguments[2] if command == "dispatch" and len(arguments) >= 3 else None
+    if not (
+        (command in {"render", "audit"} and len(arguments) == 1)
+        or (command == "dispatch" and len(arguments) == 4)
+    ):
+        return _write_error("invalid-invocation", menu_id)
+    try:
+        if command == "audit":
+            report = audit_inventory(
+                load_source(system_path), load_compatibility(compatibility_path)
+            )
+            sys.stdout.write(json.dumps(report, ensure_ascii=False, sort_keys=True) + "\n")
+            return 0 if report["ok"] else _write_error("inventory-incomplete")
+
+        model = build_model(system_path, extension_path, compatibility_path)
+        if command == "render":
+            sys.stdout.write(
+                json.dumps(model["view"], ensure_ascii=False, sort_keys=True) + "\n"
+            )
+            return 0
+
+        requested_revision, requested_id, requested_token = arguments[1:]
+        entries = model["entries"]
+        assert isinstance(entries, dict)
+        payload = validate_dispatch(
+            entries,
+            current_revision=str(model["revision"]),
+            requested_revision=requested_revision,
+            menu_id=requested_id,
+            requested_token=requested_token,
+        )
+        execute_payload(payload, adapter_dir=adapter_dir)
+        return 0
+    except SourceError:
+        return _write_error("source-invalid", menu_id)
+    except GuardDeadlineExceeded:
+        return _write_error("state-unavailable", menu_id)
+    except DispatchRejected as exc:
+        return _write_error(
+            "stale-selection" if exc.reason == "stale" else "selection-rejected",
+            menu_id,
+        )
+    except ActionUnavailable:
+        return _write_error("action-unavailable", menu_id)
+    except ActionStartError:
+        return _write_error("start-failure", menu_id)
+    except (OSError, UnicodeError):
+        return _write_error("state-unavailable", menu_id)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
