@@ -32,9 +32,9 @@ class CompatibilityInventoryTests(unittest.TestCase):
         document = json.loads(COMPATIBILITY.read_text(encoding="utf-8"))
         rules = document["rules"]
 
-        self.assertEqual(len(actionable), 272)
+        self.assertEqual(len(actionable), 275)
         self.assertEqual(
-            sum(bool(row.get("action")) for row in actionable.values()), 270
+            sum(bool(row.get("action")) for row in actionable.values()), 273
         )
         self.assertEqual(
             sum(bool(row.get("provider")) for row in actionable.values()), 2
@@ -442,10 +442,10 @@ class CompatibilityInventoryTests(unittest.TestCase):
         report = menu_adapter.audit_inventory(self.source, self.document)
 
         self.assertTrue(report.get("ok"))
-        self.assertEqual(report.get("stockRows"), 272)
+        self.assertEqual(report.get("stockRows"), 275)
         self.assertEqual(
             report.get("counts"),
-            {"pass-through": 192, "mapped": 28, "provider": 1, "disabled": 51},
+            {"pass-through": 195, "mapped": 28, "provider": 1, "disabled": 51},
         )
         self.assertEqual(report.get("missing"), [])
         self.assertEqual(report.get("signatureMismatches"), [])

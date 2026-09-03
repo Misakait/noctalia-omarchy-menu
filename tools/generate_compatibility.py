@@ -300,7 +300,7 @@ def main() -> None:
     document = {
         "schemaVersion": 1,
         "stockSource": str(STOCK_MENU),
-        "omarchyPackage": "omarchy-dev 4.0.0.r1979.gb686ed8-1",
+        "omarchyPackage": "omarchy-dev 4.0.0.r2014.gf99d33a-1",
         "rules": rules,
     }
     OUTPUT.write_text(
