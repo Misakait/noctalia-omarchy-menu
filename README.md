@@ -29,7 +29,20 @@
 
 ## 截图
 
-截图将在首个公开版本发布后补充。这里暂不使用与实际界面不一致的示意图。
+<table>
+  <tr>
+    <th>主菜单</th>
+    <th>Trigger 子菜单</th>
+  </tr>
+  <tr>
+    <td>
+      <img src="docs/screenshots/main-menu.png" alt="Noctalia 中的 Omarchy Menu 主菜单，显示 Apps、Learn、Trigger、Style、Setup、Install、Remove 和 Update 等项目">
+    </td>
+    <td>
+      <img src="docs/screenshots/trigger-menu.png" alt="Omarchy Menu 的 Trigger 子菜单，Reminder 被选中，Emoji 和 Transcode 显示为禁用并附有原因">
+    </td>
+  </tr>
+</table>
 
 ## 依赖
 
