@@ -199,6 +199,94 @@ class ModelBuilderTests(unittest.TestCase):
             self.assertNotIn(secret, serialized)
 
 
+class DispatchPreparationTests(unittest.TestCase):
+    def test_static_leaf_reads_fresh_sources_but_only_evaluates_selected_guards(self) -> None:
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            system = root / "system.jsonc"
+            extension = root / "extension.jsonc"
+            compatibility = root / "compatibility.json"
+            _write(
+                system,
+                {
+                    "selected": {"action": "selected-action", "when": "selected-visible"},
+                    "unrelated": {"action": "unrelated-action", "when": "unrelated-visible"},
+                    "fonts": {"provider": "fonts"},
+                },
+            )
+            _write(extension, {})
+            _write(
+                compatibility,
+                {
+                    "schemaVersion": 1,
+                    "omarchyPackage": "fixture",
+                    "rules": {
+                        "selected": {
+                            "match": {"action": "selected-action", "provider": ""},
+                            "mode": "mapped",
+                            "dispatch": {"mode": "argv", "argv": ["selected-command"]},
+                        },
+                        "unrelated": {
+                            "match": {"action": "unrelated-action", "provider": ""},
+                            "mode": "mapped",
+                            "dispatch": {"mode": "argv", "argv": ["unrelated-command"]},
+                        },
+                        "fonts": {
+                            "match": {"action": "", "provider": "fonts"},
+                            "mode": "provider",
+                        },
+                    },
+                },
+            )
+            rendered = menu_adapter.build_model(
+                system,
+                extension,
+                compatibility,
+                guard_runner=lambda _expression: True,
+                provider_runner=lambda argv: "Fixture Font\n",
+                dependency_available=lambda _name: True,
+            )
+            selected = rendered["entries"]["selected"]
+            guard_calls: list[str] = []
+
+            self.assertTrue(
+                hasattr(menu_adapter, "prepare_dispatch_payload"),
+                "dispatch must have a target-scoped preparation path",
+            )
+            payload = menu_adapter.prepare_dispatch_payload(
+                system,
+                extension,
+                compatibility,
+                requested_revision=rendered["revision"],
+                requested_id="selected",
+                requested_token=menu_adapter.action_token(selected),
+                guard_runner=lambda expression: guard_calls.append(expression) or True,
+                provider_runner=lambda _argv: (_ for _ in ()).throw(
+                    AssertionError("unrelated provider must not run")
+                ),
+                dependency_available=lambda _name: True,
+            )
+
+            self.assertEqual(payload, {"mode": "argv", "argv": ["selected-command"]})
+            self.assertEqual(guard_calls, ["selected-visible"])
+
+            _write(extension, {"selected": {"label": "changed after render"}})
+            with self.assertRaises(menu_adapter.DispatchRejected) as stale:
+                menu_adapter.prepare_dispatch_payload(
+                    system,
+                    extension,
+                    compatibility,
+                    requested_revision=rendered["revision"],
+                    requested_id="selected",
+                    requested_token=menu_adapter.action_token(selected),
+                    guard_runner=lambda expression: guard_calls.append(expression) or True,
+                    provider_runner=lambda _argv: "",
+                    dependency_available=lambda _name: True,
+                )
+            self.assertEqual(stale.exception.reason, "stale")
+            self.assertEqual(guard_calls, ["selected-visible"])
+
+
 class ProcessBoundaryTests(unittest.TestCase):
     def test_guard_timeout_kills_and_reaps_descendant_process_group(self) -> None:
         with TemporaryDirectory() as directory:
@@ -479,6 +567,59 @@ class CliEndToEndTests(unittest.TestCase):
             while not marker.exists() and time.monotonic() < deadline:
                 time.sleep(0.01)
             self.assertEqual(marker.read_text(), "complete")
+
+    def test_cli_dispatch_skips_unrelated_slow_guards(self) -> None:
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            env, marker = self._fixture(root)
+            system_path = Path(env["OMARCHY_MENU_SYSTEM_SOURCE"])
+            compatibility_path = Path(env["OMARCHY_MENU_COMPATIBILITY"])
+            system = json.loads(system_path.read_text(encoding="utf-8"))
+            compatibility = json.loads(compatibility_path.read_text(encoding="utf-8"))
+            compatibility["rules"]["safe"]["dispatch"] = {
+                "mode": "argv",
+                "argv": ["/usr/bin/true"],
+            }
+            for index in range(16):
+                menu_id = f"slow-{index}"
+                action = f"stock-{menu_id}"
+                system[menu_id] = {"action": action, "when": "sleep 1"}
+                compatibility["rules"][menu_id] = {
+                    "match": {"action": action, "provider": ""},
+                    "mode": "mapped",
+                    "dispatch": {"mode": "argv", "argv": ["/usr/bin/true"]},
+                }
+            _write(system_path, system)
+            _write(compatibility_path, compatibility)
+            normalized = menu_adapter.normalize_menu(system)
+            safe = menu_adapter.resolve_compatibility(
+                normalized["safe"],
+                compatibility["rules"],
+                source="system",
+                dependency_available=lambda _name: True,
+            )
+            revision = menu_adapter.compute_revision(system, compatibility)
+
+            started = time.monotonic()
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    str(ADAPTER),
+                    "dispatch",
+                    revision,
+                    "safe",
+                    menu_adapter.action_token(safe),
+                ],
+                env=env,
+                text=True,
+                capture_output=True,
+                timeout=5,
+            )
+            elapsed = time.monotonic() - started
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertLess(elapsed, 0.5)
+            self.assertFalse(marker.exists())
 
     def test_audit_reports_inventory_and_exits_nonzero_when_incomplete(self) -> None:
         with TemporaryDirectory() as directory:

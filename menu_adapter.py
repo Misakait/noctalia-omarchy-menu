@@ -1374,6 +1374,125 @@ def validate_dispatch(
     return deepcopy(entry["dispatch"])
 
 
+def _entry_source_owner(
+    menu_id: str,
+    system: dict[str, dict[str, object]],
+    extension: dict[str, dict[str, object]],
+    merged: dict[str, dict[str, object]],
+) -> str:
+    if menu_id == "root" or menu_id not in extension:
+        return "system"
+    if menu_id not in system:
+        return "extension"
+    old_signature = (
+        _string(system[menu_id].get("action")),
+        _string(system[menu_id].get("provider")),
+    )
+    new_signature = (
+        _string(merged[menu_id].get("action")),
+        _string(merged[menu_id].get("provider")),
+    )
+    return "extension" if new_signature != old_signature else "system"
+
+
+def _has_valid_parent_chain(
+    entries: dict[str, dict[str, object]], menu_id: str
+) -> bool:
+    seen: set[str] = set()
+    current = menu_id
+    while current != "root":
+        if current in seen:
+            return False
+        seen.add(current)
+        entry = entries.get(current)
+        if entry is None:
+            return False
+        parent = _string(entry.get("parent")) or "root"
+        if parent not in entries:
+            return False
+        current = parent
+    return True
+
+
+def prepare_dispatch_payload(
+    system_path: Path,
+    extension_path: Path,
+    compatibility_path: Path,
+    *,
+    requested_revision: str,
+    requested_id: str,
+    requested_token: str,
+    guard_runner: Callable[[str], bool] | None = None,
+    provider_runner: Callable[[list[str]], str] | None = None,
+    dependency_available: Callable[[str], bool] | None = None,
+) -> dict[str, object]:
+    """Read current sources and validate a dispatch without rebuilding unrelated state."""
+
+    system = load_source(system_path)
+    extension = load_source(extension_path, required=False)
+    compatibility = load_compatibility(compatibility_path)
+    merged = merge_sources(system, extension)
+    revision = compute_revision(merged, compatibility)
+    if requested_revision != revision:
+        raise DispatchRejected("stale")
+
+    normalized = normalize_menu(merged)
+    target = normalized.get(requested_id)
+    has_children = any(
+        _string(entry.get("parent")) == requested_id
+        for menu_id, entry in normalized.items()
+        if menu_id != "root"
+    )
+    if (
+        target is not None
+        and not has_children
+        and _has_valid_parent_chain(normalized, requested_id)
+    ):
+        raw_rules = compatibility["rules"]
+        assert isinstance(raw_rules, dict)
+        rules = {
+            menu_id: rule
+            for menu_id, rule in raw_rules.items()
+            if isinstance(menu_id, str) and isinstance(rule, dict)
+        }
+        resolved = resolve_compatibility(
+            target,
+            rules,
+            source=_entry_source_owner(requested_id, system, extension, merged),
+            dependency_available=dependency_available,
+        )
+        if resolved.get("kind") == "action":
+            evaluated, _warnings = evaluate_guards(
+                {requested_id: resolved}, guard_runner or GuardRunner()
+            )
+            evaluated[requested_id]["children"] = []
+            return validate_dispatch(
+                evaluated,
+                current_revision=revision,
+                requested_revision=requested_revision,
+                menu_id=requested_id,
+                requested_token=requested_token,
+            )
+
+    model = build_model(
+        system_path,
+        extension_path,
+        compatibility_path,
+        guard_runner=guard_runner,
+        provider_runner=provider_runner,
+        dependency_available=dependency_available,
+    )
+    entries = model["entries"]
+    assert isinstance(entries, dict)
+    return validate_dispatch(
+        entries,
+        current_revision=str(model["revision"]),
+        requested_revision=requested_revision,
+        menu_id=requested_id,
+        requested_token=requested_token,
+    )
+
+
 def build_model(
     system_path: Path = _SYSTEM_SOURCE,
     extension_path: Path = _EXTENSION_SOURCE,
@@ -1402,25 +1521,10 @@ def build_model(
 
     resolved: dict[str, dict[str, object]] = {}
     for menu_id, entry in normalized.items():
-        owner = "system"
-        if menu_id != "root" and menu_id in extension:
-            if menu_id not in system:
-                owner = "extension"
-            else:
-                old_signature = (
-                    _string(system[menu_id].get("action")),
-                    _string(system[menu_id].get("provider")),
-                )
-                new_signature = (
-                    _string(merged[menu_id].get("action")),
-                    _string(merged[menu_id].get("provider")),
-                )
-                if new_signature != old_signature:
-                    owner = "extension"
         resolved[menu_id] = resolve_compatibility(
             entry,
             rules,
-            source=owner,
+            source=_entry_source_owner(menu_id, system, extension, merged),
             dependency_available=dependency_available,
         )
 
@@ -1606,21 +1710,20 @@ def main(argv: list[str] | None = None, environment: dict[str, str] | None = Non
             sys.stdout.write(json.dumps(report, ensure_ascii=False, sort_keys=True) + "\n")
             return 0 if report["ok"] else _write_error("inventory-incomplete")
 
-        model = build_model(system_path, extension_path, compatibility_path)
         if command == "render":
+            model = build_model(system_path, extension_path, compatibility_path)
             sys.stdout.write(
                 json.dumps(model["view"], ensure_ascii=False, sort_keys=True) + "\n"
             )
             return 0
 
         requested_revision, requested_id, requested_token = arguments[1:]
-        entries = model["entries"]
-        assert isinstance(entries, dict)
-        payload = validate_dispatch(
-            entries,
-            current_revision=str(model["revision"]),
+        payload = prepare_dispatch_payload(
+            system_path,
+            extension_path,
+            compatibility_path,
             requested_revision=requested_revision,
-            menu_id=requested_id,
+            requested_id=requested_id,
             requested_token=requested_token,
         )
         execute_payload(payload, adapter_dir=adapter_dir)
