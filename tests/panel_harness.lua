@@ -15,6 +15,9 @@ local runs = {}
 local notifications = {}
 local nextRunReturns = true
 local decodeValues = {}
+local files = {}
+local writes = {}
+local renames = {}
 local closed = 0
 local longActionId = string.rep("long-action-id-", 8)
 
@@ -33,6 +36,19 @@ ui = {
 
 noctalia = {
   pluginDir = function() return "/fixture/plugin" end,
+  pluginDataDir = function() return "/fixture/data" end,
+  readFile = function(path) return files[path] end,
+  writeFile = function(path, content)
+    files[path] = content
+    table.insert(writes, { path = path, content = content })
+    return true
+  end,
+  renameFile = function(source, destination)
+    files[destination] = files[source]
+    files[source] = nil
+    table.insert(renames, { source = source, destination = destination })
+    return true
+  end,
   runAsync = function(argv, callback, timeout)
     if argv[3] == "dispatch" then check(closed == 1, "panel closes before dispatch spawn") end
     local item = { argv = argv, callback = callback, timeout = timeout }
@@ -124,11 +140,37 @@ local function reset()
   notifications = {}
   nextRunReturns = true
   decodeValues = {}
+  files = {}
+  writes = {}
+  renames = {}
   closed = 0
   renders = 0
   panelRenders = 0
   lastPanelTree = nil
   onClose()
+end
+
+local function test_persistent_cache_renders_before_background_refresh()
+  reset()
+  local cachePath = "/fixture/data/menu-cache-v1.json"
+  files[cachePath] = "cached"
+  decodeValues.cached = fixture("cache-revision", "Cached Run")
+  decodeValues.fresh = fixture("fresh-revision", "Fresh Run")
+
+  onOpen({})
+  equal(#runs, 1, "cached open still starts a background refresh")
+  check(hasText(lastPanelTree, "Cached Run"), "cached model is committed before refresh completes")
+  check(not hasText(lastPanelTree, "Loading…"), "cached model does not show a blocking loading label")
+  runs[1].callback({ exitCode = 0, stdout = "fresh" })
+  equal(#writes, 1, "fresh validated model is persisted")
+  equal(writes[1].path, cachePath .. ".tmp", "cache is staged in the plugin data directory")
+  equal(writes[1].content, "fresh", "cache stores the validated redacted model")
+  equal(#renames, 1, "staged cache is atomically promoted")
+  equal(renames[1].source, cachePath .. ".tmp", "cache promotion starts from staging path")
+  equal(renames[1].destination, cachePath, "cache promotion replaces the live cache")
+  equal(files[cachePath], "fresh", "promoted cache is readable at the stable path")
+  check(hasText(lastPanelTree, "Fresh Run"), "fresh model replaces cached model")
+  cases = cases + 1
 end
 
 local function openGood()
@@ -162,7 +204,7 @@ local function test_open_commits_tree_to_host_panel()
   decodeValues.good = fixture()
   onOpen({})
   equal(panelRenders, 1, "opening commits loading tree through panel.render")
-  check(lastPanelTree ~= nil and hasText(lastPanelTree, "Loading…"), "host receives loading tree")
+  check(lastPanelTree ~= nil and hasText(lastPanelTree, "Omarchy Menu"), "host receives opening tree")
   runs[1].callback({ exitCode = 0, stdout = "good" })
   equal(panelRenders, 2, "completed refresh commits model tree through panel.render")
   check(hasText(lastPanelTree, "Run"), "host receives populated tree")
@@ -211,6 +253,19 @@ local function test_close_invalidates_render_callback_without_rendering()
   equal(renders, beforeClose, "close does not render")
   runs[1].callback({ exitCode = 0, stdout = "good" })
   equal(renders, beforeClose, "closed callback does not render")
+  cases = cases + 1
+end
+
+local function test_closed_panel_persists_latest_completed_refresh()
+  reset()
+  decodeValues.freshAfterClose = fixture("closed-refresh", "Closed Refresh")
+  onOpen({})
+  local beforeClose = panelRenders
+  onClose()
+  runs[1].callback({ exitCode = 0, stdout = "freshAfterClose" })
+  equal(panelRenders, beforeClose, "closed refresh never mutates the visible tree")
+  equal(#writes, 1, "latest validated refresh is cached after close")
+  equal(writes[1].content, "freshAfterClose", "closed refresh persists exact validated stdout")
   cases = cases + 1
 end
 
@@ -263,19 +318,41 @@ local function test_clear_rekeys_input_and_window_is_eight_rows()
   cases = cases + 1
 end
 
+local function test_layout_anchors_navigation_hint_at_bottom_center()
+  reset()
+  openGood()
+  local tree = render()
+  local menuBody = find(tree, function(item)
+    return item.kind == "column" and item.props.key == "menu-body"
+  end)
+  check(menuBody ~= nil, "menu rows live in a dedicated body")
+  equal(menuBody.props.flexGrow, 1, "menu body consumes remaining height")
+  local footer = tree.children[#tree.children]
+  equal(footer.kind, "row", "footer is the final root child")
+  equal(footer.props.key, "footer", "footer has stable role key")
+  equal(footer.props.justify, "center", "footer content is horizontally centered")
+  local hint = find(footer, function(item)
+    return item.kind == "label" and string.find(item.props.text or "", "Navigate", 1, true) ~= nil
+  end)
+  check(hint ~= nil, "footer exposes keyboard navigation hint")
+  equal(hint.props.textAlign, "center", "keyboard hint text is centered")
+  equal(row("row-run").props.fill, "surface_variant/0.20", "unselected rows use a subtle card fill")
+  cases = cases + 1
+end
+
 local function test_keyboard_pressed_navigation_and_parent()
   reset()
   openGood()
   check(find(render(), function(item) return item.kind == "row" and item.props.selected ~= nil end) == nil,
     "row selection uses supported visual props")
-  onKey({ key = "down", pressed = false })
+  onKey("down", false)
   equal(selectedRowKey(), "row-folder", "released key ignored")
-  onKey({ key = "down", pressed = true })
+  onKey("down", true)
   equal(selectedRowKey(), "row-run", "down moves selection")
-  onKey({ key = "up", pressed = true })
-  onKey({ key = "right", pressed = true })
+  onKey("up", true)
+  onKey("right", true)
   check(hasText(render(), "Folder"), "right opens selected menu")
-  onKey({ key = "left", pressed = true })
+  onKey("left", true)
   check(row("row-folder") ~= nil, "left returns to parent")
   cases = cases + 1
 end
@@ -283,10 +360,10 @@ end
 local function test_keyboard_and_pointer_links_navigate_to_target()
   reset()
   openGood()
-  onKey({ key = "down", pressed = true })
-  onKey({ key = "down", pressed = true })
-  onKey({ key = "down", pressed = true })
-  onKey({ key = "right", pressed = true })
+  onKey("down", true)
+  onKey("down", true)
+  onKey("down", true)
+  onKey("right", true)
   check(row("row-deep") ~= nil, "keyboard right follows link target")
   reset()
   openGood()
@@ -300,17 +377,17 @@ local function test_page_navigation_clamps_and_skips_disabled_landing_rows()
   openGood()
   row("row-page").props.onClick()
   equal(selectedRowKey(), "row-r1", "page starts at first activatable row")
-  onKey({ key = "next", pressed = true })
+  onKey("next", true)
   equal(selectedRowKey(), "row-r10", "next skips disabled r9 in requested direction")
-  onKey({ key = "next", pressed = true })
+  onKey("next", true)
   equal(selectedRowKey(), "row-r11", "next clamps then searches back from disabled edge")
-  onKey({ key = "next", pressed = true })
+  onKey("next", true)
   equal(selectedRowKey(), "row-r11", "next may remain at clamped disabled edge")
-  onKey({ key = "prior", pressed = true })
+  onKey("prior", true)
   equal(selectedRowKey(), "row-r3", "prior uses non-cyclic page target")
-  onKey({ key = "prior", pressed = true })
+  onKey("prior", true)
   equal(selectedRowKey(), "row-r1", "prior clamps at first row")
-  onKey({ key = "prior", pressed = true })
+  onKey("prior", true)
   equal(selectedRowKey(), "row-r1", "prior remains at first edge")
   cases = cases + 1
 end
@@ -372,7 +449,7 @@ end
 local function test_submit_uses_selected_row_and_retry_starts_new_generation()
   reset()
   openGood()
-  onKey({ key = "down", pressed = true })
+  onKey("down", true)
   input().props.onSubmit("anything")
   equal(closed, 1, "submit activates current selection")
   reset()
@@ -385,13 +462,16 @@ local function test_submit_uses_selected_row_and_retry_starts_new_generation()
   cases = cases + 1
 end
 
+test_persistent_cache_renders_before_background_refresh()
 test_generation_and_last_known_good()
 test_open_commits_tree_to_host_panel()
 test_later_success_wins_over_older_success()
 test_rejects_bad_results_and_spawn_failure()
 test_close_invalidates_render_callback_without_rendering()
+test_closed_panel_persists_latest_completed_refresh()
 test_search_is_breadth_first_and_excludes_disabled()
 test_clear_rekeys_input_and_window_is_eight_rows()
+test_layout_anchors_navigation_hint_at_bottom_center()
 test_keyboard_pressed_navigation_and_parent()
 test_keyboard_and_pointer_links_navigate_to_target()
 test_page_navigation_clamps_and_skips_disabled_landing_rows()
@@ -400,5 +480,5 @@ test_pointer_dispatch_closes_first_and_is_exact_argv()
 test_long_ids_dispatch_unchanged_but_notifications_are_bounded()
 test_submit_uses_selected_row_and_retry_starts_new_generation()
 
-equal(cases, 14, "case count")
-print("panel harness: 14 passed")
+equal(cases, 17, "case count")
+print("panel harness: 17 passed")

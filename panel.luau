@@ -6,6 +6,8 @@
 local WINDOW_SIZE = 8
 local RENDER_TIMEOUT_MS = 10000
 local DISPATCH_TIMEOUT_MS = 10000
+local CACHE_FILENAME = "menu-cache-v1.json"
+local MAX_CACHE_BYTES = 2 * 1024 * 1024
 
 local generation = 0
 local open = false
@@ -17,6 +19,7 @@ local currentId = ""
 local selectedId = ""
 local query = ""
 local inputRevision = 0
+local cacheLoaded = false
 
 local function adapterPath()
   return noctalia.pluginDir() .. "/menu_adapter.py"
@@ -45,6 +48,35 @@ local function modelIsValid(value)
   if type(value.root) ~= "string" or value.root == "" then return false end
   if type(value.entries) ~= "table" then return false end
   return type(value.entries[value.root]) == "table"
+end
+
+local function cachePath()
+  local ok, directory = pcall(noctalia.pluginDataDir)
+  if not ok or type(directory) ~= "string" or directory == "" then return nil end
+  return directory .. "/" .. CACHE_FILENAME
+end
+
+local function restoreCache()
+  if cacheLoaded then return end
+  cacheLoaded = true
+  local path = cachePath()
+  if path == nil then return end
+  local readOk, raw = pcall(noctalia.readFile, path)
+  if not readOk or type(raw) ~= "string" or raw == "" or #raw > MAX_CACHE_BYTES then return end
+  local decodeOk, decoded = pcall(noctalia.json.decode, raw)
+  if not decodeOk or not modelIsValid(decoded) then return end
+  model = decoded
+  lastGood = decoded
+end
+
+local function persistCache(raw)
+  if type(raw) ~= "string" or raw == "" or #raw > MAX_CACHE_BYTES then return end
+  local path = cachePath()
+  if path == nil then return end
+  local staging = path .. ".tmp"
+  local writeOk, wrote = pcall(noctalia.writeFile, staging, raw)
+  if not writeOk or wrote == false then return end
+  pcall(noctalia.renameFile, staging, path)
 end
 
 local function isVisible(entry)
@@ -205,21 +237,23 @@ local function refresh()
   local started = noctalia.runAsync(
     { "python3", adapterPath(), "render" },
     function(result)
-      if not open or requestGeneration ~= generation then return end
+      if requestGeneration ~= generation then return end
       if result == nil or result.timedOut == true or result.stdoutTruncated == true
         or result.stderrTruncated == true or result.exitCode ~= 0 or type(result.stdout) ~= "string" then
-        failRefresh()
+        if open then failRefresh() else loading = false end
         return
       end
       local ok, decoded = pcall(noctalia.json.decode, result.stdout)
       if not ok or not modelIsValid(decoded) then
-        failRefresh()
+        if open then failRefresh() else loading = false end
         return
       end
       model = decoded
       lastGood = decoded
+      persistCache(result.stdout)
       loading = false
       refreshError = ""
+      if not open then return end
       if entryFor(currentId) == nil then currentId = stringValue(model.root) end
       ensureSelection(rowsForCurrent())
       render()
@@ -291,19 +325,30 @@ local function rowNode(id)
   local icon = stringValue(entry.icon)
   local label = stringValue(entry.label)
   local title = icon ~= "" and (icon .. " " .. label) or label
-  local props = { key = "row-" .. id, gap = 8, align = "center", paddingH = 6, paddingV = 4, radius = 6 }
-  if id == selectedId then
-    props.fill = "primary/0.10"
-    props.border = "primary/0.55"
-    props.borderWidth = 1
-  end
-  if not isActivatable(entry) then props.opacity = 0.5 else props.onClick = function() activate(id) end end
-  local children = {
-    ui.label({ text = title, flexGrow = 1 }),
+  local selected = id == selectedId
+  local props = {
+    key = "row-" .. id,
+    gap = 10,
+    align = "center",
+    paddingH = 10,
+    paddingV = 8,
+    radius = 8,
+    fill = selected and "primary/0.10" or "surface_variant/0.20",
+    border = selected and "primary/0.55" or "outline/0.10",
+    borderWidth = 1,
   }
-  if entry.checked == true then table.insert(children, ui.label({ text = "✓", color = "primary" })) end
+  if not isActivatable(entry) then props.opacity = 0.5 else props.onClick = function() activate(id) end end
+  local text = {
+    ui.label({ text = title, color = selected and "primary" or "on_surface", maxLines = 1 }),
+  }
   local reason = stringValue(entry.disabledReason)
-  if reason ~= "" then table.insert(children, ui.label({ text = reason, fontSize = 11, color = "on_surface_variant" })) end
+  if reason ~= "" then table.insert(text, ui.label({ text = reason, fontSize = 10, color = "on_surface_variant", maxLines = 1 })) end
+  local children = { ui.column({ gap = 1, flexGrow = 1 }, text) }
+  if entry.checked == true then table.insert(children, ui.label({ text = "✓", color = "primary" })) end
+  local kind = stringValue(entry.kind)
+  if kind == "menu" or kind == "link" then
+    table.insert(children, ui.label({ text = "›", fontSize = 18, color = "on_surface_variant" }))
+  end
   return ui.row(props, children)
 end
 
@@ -311,13 +356,20 @@ render = function()
   local rows = rowsForCurrent()
   local selected = ensureSelection(rows)
   local window, first, last = visibleWindow(rows, selected)
+  local current = entryFor(currentId)
+  local parent = current and stringValue(current.parent) or ""
   local header = {
-    ui.label({ text = "Omarchy Menu", fontSize = 16, fontWeight = "bold", flexGrow = 1 }),
-    ui.button({ text = "Close", variant = "ghost", onClick = function() panel.close() end }),
+    ui.column({ key = "heading", gap = 0, flexGrow = 1 }, {
+      ui.label({ text = "Omarchy Menu", fontSize = 18, fontWeight = "bold", color = "on_surface" }),
+      ui.label({ text = breadcrumb(), fontSize = 11, color = "on_surface_variant", maxLines = 1 }),
+    }),
   }
+  if parent ~= "" and entryFor(parent) ~= nil then
+    table.insert(header, ui.button({ key = "back", glyph = "arrow-left", variant = "ghost", tooltip = "Back", onClick = navigateParent }))
+  end
+  table.insert(header, ui.button({ key = "close", glyph = "close", variant = "ghost", tooltip = "Close", onClick = function() panel.close() end }))
   local body = {
     ui.row({ key = "header", gap = 8, align = "center" }, header),
-    ui.label({ text = breadcrumb(), fontSize = 12, color = "on_surface_variant" }),
     ui.row({ key = "search-row", gap = 6, align = "center" }, {
       ui.input({
         key = "search-" .. tostring(inputRevision),
@@ -349,24 +401,32 @@ render = function()
       ui.button({ text = "Retry", variant = "ghost", onClick = refresh }),
     }))
   end
-  if loading then table.insert(body, ui.label({ text = "Loading…", color = "on_surface_variant" })) end
   if model ~= nil then
     local warnings = tableValue(model.warnings) or {}
     for _, warning in ipairs(warnings) do
       if type(warning) == "string" then table.insert(body, ui.label({ text = "Warning: " .. warning, fontSize = 11, color = "on_surface_variant" })) end
     end
   end
+  local list = {}
   if #rows == 0 then
-    table.insert(body, ui.label({ text = loading and "Loading menu…" or "No matching menu items", color = "on_surface_variant", flexGrow = 1 }))
+    table.insert(list, ui.label({
+      text = loading and model == nil and "Loading menu…" or "No matching menu items",
+      color = "on_surface_variant",
+      flexGrow = 1,
+      textAlign = "center",
+    }))
   else
-    for _, id in ipairs(window) do table.insert(body, rowNode(id)) end
-    table.insert(body, ui.label({ text = tostring(first) .. "–" .. tostring(last) .. " / " .. tostring(#rows), fontSize = 11, color = "on_surface_variant" }))
+    for _, id in ipairs(window) do table.insert(list, rowNode(id)) end
+    table.insert(list, ui.spacer({ key = "list-spacer", flexGrow = 1 }))
+    table.insert(list, ui.row({ key = "page-status", justify = "center" }, {
+      ui.label({ text = tostring(first) .. "–" .. tostring(last) .. " of " .. tostring(#rows), fontSize = 10, color = "on_surface_variant", textAlign = "center" }),
+    }))
   end
-  table.insert(body, ui.row({ key = "footer", gap = 6 }, {
-    ui.button({ text = "Back", variant = "ghost", onClick = navigateParent }),
-    ui.label({ text = "↑↓ select  PgUp/PgDn page  ← back  → open", fontSize = 11, color = "on_surface_variant" }),
+  table.insert(body, ui.column({ key = "menu-body", flexGrow = 1, gap = 5, align = "stretch" }, list))
+  table.insert(body, ui.row({ key = "footer", justify = "center", align = "center" }, {
+    ui.label({ text = "↑↓ Navigate   PgUp/PgDn Page   ← Back   → Open", fontSize = 10, color = "on_surface_variant", textAlign = "center" }),
   }))
-  local tree = ui.column({ key = "menu-root", flexGrow = 1, gap = 8, align = "stretch" }, body)
+  local tree = ui.column({ key = "menu-root", flexGrow = 1, gap = 10, align = "stretch" }, body)
   panel.render(tree)
   return tree
 end
@@ -375,6 +435,7 @@ function onOpen(_context)
   open = true
   query = ""
   inputRevision = inputRevision + 1
+  restoreCache()
   if model ~= nil and type(model.root) == "string" then currentId = model.root end
   selectedId = ""
   refresh()
@@ -383,16 +444,15 @@ end
 function onClose()
   open = false
   loading = false
-  generation = generation + 1
 end
 
-function onKey(event)
-  if type(event) ~= "table" or event.pressed ~= true then return end
-  local key = string.lower(stringValue(event.key))
+function onKey(chord, pressed)
+  if type(chord) ~= "string" or pressed ~= true then return end
+  local key = string.lower(chord)
   if key == "up" then moveSelection(-1)
   elseif key == "down" then moveSelection(1)
-  elseif key == "prior" then movePage(-WINDOW_SIZE)
-  elseif key == "next" then movePage(WINDOW_SIZE)
+  elseif key == "prior" or key == "pageup" or key == "pgup" then movePage(-WINDOW_SIZE)
+  elseif key == "next" or key == "pagedown" or key == "pgdn" then movePage(WINDOW_SIZE)
   elseif key == "left" then navigateParent()
   elseif key == "right" then
     local rows = rowsForCurrent()
