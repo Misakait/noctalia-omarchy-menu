@@ -102,7 +102,7 @@ class CaptureHelperTests(unittest.TestCase):
 
 
 class PowerHelperTests(unittest.TestCase):
-    def test_power_helpers_schedule_before_quitting_niri(self) -> None:
+    def test_power_helpers_request_system_action_without_quitting_niri(self) -> None:
         for operation in ("reboot", "poweroff"):
             with self.subTest(operation=operation):
                 script_name = (
@@ -117,6 +117,10 @@ class PowerHelperTests(unittest.TestCase):
                     bin_dir = root / "bin"
                     bin_dir.mkdir()
                     trace = root / "trace"
+                    _write_executable(
+                        bin_dir / "systemctl",
+                        'printf "systemctl:%s\\n" "$*" >>"$TRACE"\n',
+                    )
                     _write_executable(
                         bin_dir / "systemd-run",
                         'printf "systemd-run:%s\\n" "$*" >>"$TRACE"\n',
@@ -142,11 +146,7 @@ class PowerHelperTests(unittest.TestCase):
                     self.assertEqual(completed.returncode, 0, completed.stderr)
                     self.assertEqual(
                         trace.read_text(encoding="utf-8").splitlines(),
-                        [
-                            "systemd-run:--user --collect --quiet --on-active=2s "
-                            f"--timer-property=AccuracySec=100ms systemctl {operation} --no-wall",
-                            "niri:msg action quit --skip-confirmation",
-                        ],
+                        [f"systemctl:{operation} --no-wall"],
                     )
 
 

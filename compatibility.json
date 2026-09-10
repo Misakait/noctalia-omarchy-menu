@@ -110,9 +110,7 @@
         "args": []
       },
       "requires": [
-        "systemd-run",
-        "systemctl",
-        "niri"
+        "systemctl"
       ]
     },
     "system.shutdown": {
@@ -127,9 +125,7 @@
         "args": []
       },
       "requires": [
-        "systemd-run",
-        "systemctl",
-        "niri"
+        "systemctl"
       ]
     },
     "learn.keybindings": {

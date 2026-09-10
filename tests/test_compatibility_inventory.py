@@ -233,6 +233,13 @@ class CompatibilityInventoryTests(unittest.TestCase):
                 )
                 self.assertEqual(rule["when"], "")
 
+    def test_power_helpers_only_require_the_system_manager(self) -> None:
+        for menu_id in ("system.reboot", "system.shutdown"):
+            with self.subTest(menu_id=menu_id):
+                self.assertEqual(
+                    self.document["rules"][menu_id]["requires"], ["systemctl"]
+                )
+
     def test_missing_mapped_dependency_disables_without_exposing_dispatch(self) -> None:
         entry = menu_adapter.normalize_menu(
             {"capture": {"action": "stock-capture"}}

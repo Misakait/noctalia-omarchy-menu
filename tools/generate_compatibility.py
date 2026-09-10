@@ -163,8 +163,8 @@ DISABLED = {
 SCRIPT_REQUIREMENTS = {
     "scripts/capture-text": ["slurp", "grim", "tesseract", "wl-copy"],
     "scripts/capture-qr": ["slurp", "grim", "zbarimg", "wl-copy"],
-    "scripts/system-reboot": ["systemd-run", "systemctl", "niri"],
-    "scripts/system-shutdown": ["systemd-run", "systemctl", "niri"],
+    "scripts/system-reboot": ["systemctl"],
+    "scripts/system-shutdown": ["systemctl"],
 }
 
 PROVIDER_REQUIREMENTS = {
