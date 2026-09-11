@@ -191,6 +191,7 @@ class CompatibilityInventoryTests(unittest.TestCase):
         script_mappings = {
             "trigger.capture.text": "scripts/capture-text",
             "trigger.capture.qr": "scripts/capture-qr",
+            "setup.security.passwordless-sudo": "scripts/passwordless-sudo-toggle",
             "system.reboot": "scripts/system-reboot",
             "system.shutdown": "scripts/system-shutdown",
         }
@@ -239,6 +240,31 @@ class CompatibilityInventoryTests(unittest.TestCase):
                 self.assertEqual(
                     self.document["rules"][menu_id]["requires"], ["systemctl"]
                 )
+
+    def test_passwordless_sudo_uses_the_boot_scoped_toggle(self) -> None:
+        rule = self.document["rules"]["setup.security.passwordless-sudo"]
+
+        self.assertEqual(
+            rule["requires"],
+            [
+                "xdg-terminal-exec",
+                "sudo",
+                "gum",
+                "visudo",
+                "install",
+                "systemctl",
+                "mktemp",
+                "chmod",
+                "id",
+                "rm",
+                "realpath",
+            ],
+        )
+        self.assertEqual(
+            rule["checked"],
+            'sudo -n test -f "/etc/sudoers.d/99-omarchy-nopasswd-$(id -un)" 2>/dev/null',
+        )
+        self.assertNotIn("digests", rule)
 
     def test_missing_mapped_dependency_disables_without_exposing_dispatch(self) -> None:
         entry = menu_adapter.normalize_menu(

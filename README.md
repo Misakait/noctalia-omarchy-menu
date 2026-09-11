@@ -61,6 +61,7 @@
 | 二维码识别 | `slurp`、`grim`、`zbarimg`、`wl-copy` |
 | 字体菜单 | `fc-list` 以及 Omarchy 自带的字体辅助命令 |
 | 录屏 | Omarchy 录屏命令及可用的桌面门户 |
+| 本次开机免密 sudo | `sudo`、`gum`、`visudo` 以及 Omarchy 的开机清理规则 |
 
 OCR 默认使用英语。可通过环境变量指定已安装的 Tesseract 语言，例如 `OMARCHY_OCR_LANGS=eng+chi_sim`。
 
@@ -85,6 +86,7 @@ install -m 0755 \
   scripts/capture-qr \
   scripts/capture-text \
   scripts/font-set \
+  scripts/passwordless-sudo-toggle \
   scripts/system-reboot \
   scripts/system-shutdown \
   "$plugin_dir/scripts/"
@@ -137,6 +139,7 @@ niri validate
 这个项目的菜单会执行真实的系统操作。选择 Install、Remove、Update、Logout、Reboot 或 Shutdown 前，请确认自己选择的项目。
 
 - 插件本身不增加二次确认，以保持 Omarchy 原版菜单的交互；Omarchy 命令自身已有的提示和确认仍会保留。
+- `Setup → Security → Passwordless Sudo` 保留原版的风险确认，但改为本次开机有效：首次运行验证管理员密码并启用，再次运行立即关闭；重启时由 Omarchy 的 `systemd-tmpfiles` 规则清除。缺少该开机清理规则时会拒绝启用。
 - 每个 Omarchy 系统 action/provider 必须匹配 `compatibility.json` 中的精确签名。
 - 已审查的 `omarchy-*` 辅助脚本及其依赖闭包使用 SHA-256 固定；脚本变更后对应操作会失败关闭，而不是静默放行。
 - 面板只收到经过白名单过滤的视图模型，不包含原始 action、dispatch 载荷或 guard。

@@ -92,6 +92,14 @@ MAPPED = {
         },
         "when": "",
     },
+    "setup.security.passwordless-sudo": {
+        "dispatch": {
+            "mode": "script",
+            "script": "scripts/passwordless-sudo-toggle",
+            "args": [],
+        },
+        "checked": 'sudo -n test -f "/etc/sudoers.d/99-omarchy-nopasswd-$(id -un)" 2>/dev/null',
+    },
     "system.lock": argv("noctalia", "msg", "session", "lock"),
     "system.logout": argv(
         "niri", "msg", "action", "quit", "--skip-confirmation"
@@ -163,6 +171,19 @@ DISABLED = {
 SCRIPT_REQUIREMENTS = {
     "scripts/capture-text": ["slurp", "grim", "tesseract", "wl-copy"],
     "scripts/capture-qr": ["slurp", "grim", "zbarimg", "wl-copy"],
+    "scripts/passwordless-sudo-toggle": [
+        "xdg-terminal-exec",
+        "sudo",
+        "gum",
+        "visudo",
+        "install",
+        "systemctl",
+        "mktemp",
+        "chmod",
+        "id",
+        "rm",
+        "realpath",
+    ],
     "scripts/system-reboot": ["systemctl"],
     "scripts/system-shutdown": ["systemctl"],
 }

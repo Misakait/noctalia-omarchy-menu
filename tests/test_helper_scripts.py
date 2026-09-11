@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import stat
 import subprocess
 import unittest
 from pathlib import Path
@@ -148,6 +149,206 @@ class PowerHelperTests(unittest.TestCase):
                         trace.read_text(encoding="utf-8").splitlines(),
                         [f"systemctl:{operation} --no-wall"],
                     )
+
+
+class PasswordlessSudoHelperTests(unittest.TestCase):
+    def _environment(self, root: Path) -> tuple[dict[str, str], Path, Path]:
+        bin_dir = root / "bin"
+        bin_dir.mkdir()
+        trace = root / "trace"
+        trace.touch()
+        grant = root / f"etc/sudoers.d/99-omarchy-nopasswd-{os.environ['USER']}"
+
+        _write_executable(bin_dir / "gum", 'printf "gum:%s\\n" "$*" >>"$TRACE"\n')
+        _write_executable(
+            bin_dir / "visudo",
+            'printf "visudo:%s\\n" "$*" >>"$TRACE"\n',
+        )
+        _write_executable(
+            bin_dir / "sudo",
+            r'''printf "sudo:%s\n" "$*" >>"$TRACE"
+if [[ ${1:-} == "-n" ]]; then
+    shift
+fi
+if [[ ${1:-} == "-k" || ${1:-} == "-v" ]]; then
+    exit 0
+fi
+command=${1:-}
+shift || true
+case "$command" in
+    test)
+        /usr/bin/test "$@"
+        ;;
+    visudo|systemctl)
+        exit 0
+        ;;
+    install)
+        args=()
+        while (($#)); do
+            case "$1" in
+                -o|-g)
+                    shift 2
+                    ;;
+                *)
+                    args+=("$1")
+                    shift
+                    ;;
+            esac
+        done
+        /usr/bin/install "${args[@]}"
+        ;;
+    rm)
+        /usr/bin/rm "$@"
+        ;;
+    *)
+        exit 64
+        ;;
+esac
+''',
+        )
+        env = os.environ | {
+            "PATH": f"{bin_dir}:/usr/bin",
+            "TRACE": str(trace),
+            "OMARCHY_MENU_TEST_ROOT": str(root),
+        }
+        return env, trace, grant
+
+    def test_nonterminal_invocation_opens_a_dedicated_terminal(self) -> None:
+        script = SCRIPTS / "passwordless-sudo-toggle"
+        self.assertTrue(script.is_file(), "passwordless sudo helper must be shipped")
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            bin_dir = root / "bin"
+            bin_dir.mkdir()
+            trace = root / "trace"
+            _write_executable(
+                bin_dir / "xdg-terminal-exec",
+                'printf "%s\\n" "$*" >"$TRACE"\n',
+            )
+            env = os.environ | {
+                "PATH": f"{bin_dir}:/usr/bin",
+                "TRACE": str(trace),
+            }
+
+            completed = subprocess.run(
+                [str(script)],
+                env=env,
+                text=True,
+                capture_output=True,
+                timeout=3,
+                check=False,
+            )
+
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            self.assertEqual(
+                trace.read_text(encoding="utf-8"),
+                " ".join(
+                    (
+                        "--app-id=org.omarchy.terminal",
+                        "--title=Boot-scoped Passwordless Sudo",
+                        "--",
+                        str(script),
+                        "--terminal\n",
+                    )
+                ),
+            )
+
+    def test_enable_survives_without_timer_and_second_run_disables(self) -> None:
+        script = SCRIPTS / "passwordless-sudo-toggle"
+        self.assertTrue(script.is_file(), "passwordless sudo helper must be shipped")
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            cleanup = root / "etc/tmpfiles.d/omarchy-nopasswd-sudo.conf"
+            cleanup.parent.mkdir(parents=True)
+            (root / "etc/sudoers.d").mkdir(parents=True)
+            cleanup.write_text(
+                "r! /etc/sudoers.d/99-omarchy-nopasswd-*\n",
+                encoding="utf-8",
+            )
+            env, trace, grant = self._environment(root)
+
+            enabled = subprocess.run(
+                [str(script), "--terminal"],
+                env=env,
+                text=True,
+                capture_output=True,
+                timeout=3,
+                check=False,
+            )
+
+            self.assertEqual(enabled.returncode, 0, enabled.stderr)
+            self.assertEqual(
+                grant.read_text(encoding="utf-8"),
+                f"{os.environ['USER']} ALL=(ALL) NOPASSWD: ALL\n",
+            )
+            self.assertEqual(stat.S_IMODE(grant.stat().st_mode), 0o440)
+            self.assertNotIn("systemd-run", trace.read_text(encoding="utf-8"))
+            self.assertNotIn("on-active", trace.read_text(encoding="utf-8"))
+
+            disabled = subprocess.run(
+                [str(script), "--terminal"],
+                env=env,
+                text=True,
+                capture_output=True,
+                timeout=3,
+                check=False,
+            )
+
+            self.assertEqual(disabled.returncode, 0, disabled.stderr)
+            self.assertFalse(grant.exists())
+            self.assertIn("sudo:-k", trace.read_text(encoding="utf-8"))
+
+    def test_enable_fails_closed_without_boot_cleanup_rule(self) -> None:
+        script = SCRIPTS / "passwordless-sudo-toggle"
+        self.assertTrue(script.is_file(), "passwordless sudo helper must be shipped")
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "etc/sudoers.d").mkdir(parents=True)
+            env, trace, grant = self._environment(root)
+
+            completed = subprocess.run(
+                [str(script), "--terminal"],
+                env=env,
+                text=True,
+                capture_output=True,
+                timeout=3,
+                check=False,
+            )
+
+            self.assertNotEqual(completed.returncode, 0)
+            self.assertFalse(grant.exists())
+            calls = trace.read_text(encoding="utf-8")
+            self.assertNotIn("sudo:visudo", calls)
+            self.assertNotIn("sudo:install", calls)
+            self.assertNotIn("visudo:", calls)
+
+    def test_higher_priority_cleanup_override_cannot_borrow_vendor_rule(self) -> None:
+        script = SCRIPTS / "passwordless-sudo-toggle"
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            override = root / "etc/tmpfiles.d/omarchy-nopasswd-sudo.conf"
+            vendor = root / "usr/lib/tmpfiles.d/omarchy-nopasswd-sudo.conf"
+            override.parent.mkdir(parents=True)
+            vendor.parent.mkdir(parents=True)
+            (root / "etc/sudoers.d").mkdir(parents=True)
+            override.write_text("# Disabled locally\n", encoding="utf-8")
+            vendor.write_text(
+                "r! /etc/sudoers.d/99-omarchy-nopasswd-*\n",
+                encoding="utf-8",
+            )
+            env, _trace, grant = self._environment(root)
+
+            completed = subprocess.run(
+                [str(script), "--terminal"],
+                env=env,
+                text=True,
+                capture_output=True,
+                timeout=3,
+                check=False,
+            )
+
+            self.assertNotEqual(completed.returncode, 0)
+            self.assertFalse(grant.exists())
 
 
 class FontHelperTests(unittest.TestCase):

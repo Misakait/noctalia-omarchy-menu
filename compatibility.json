@@ -2755,14 +2755,26 @@
         "action": "omarchy-launch-floating-terminal-with-presentation omarchy-sudo-passwordless",
         "provider": ""
       },
-      "mode": "pass-through",
-      "digests": {
-        "/usr/bin/omarchy-launch-floating-terminal-with-presentation": "01c6af7dcc7d76c23b5f95f594516195d569ede9f0f8f48f932ec5ff3531a08f",
-        "/usr/bin/omarchy-restart-gum": "fdbfea74aa25c24cb9d692a6e4048da5a7ba4c0eb9bc1a67cc33edd77507756d",
-        "/usr/bin/omarchy-show-done": "b9c975cbbc1a3d5170b57a1a37c49e7acaf2df314791936366cf87cc7609d267",
-        "/usr/bin/omarchy-show-logo": "d29f497f7f649438aa00153123cd69f79efa4ed166cba3f35899c3de08fa4c86",
-        "/usr/bin/omarchy-sudo-passwordless": "a3ea040d35806597737c7b25f6cd312e85573ab93804dcbd3c8296942542e9ba"
-      }
+      "mode": "mapped",
+      "dispatch": {
+        "mode": "script",
+        "script": "scripts/passwordless-sudo-toggle",
+        "args": []
+      },
+      "checked": "sudo -n test -f \"/etc/sudoers.d/99-omarchy-nopasswd-$(id -un)\" 2>/dev/null",
+      "requires": [
+        "xdg-terminal-exec",
+        "sudo",
+        "gum",
+        "visudo",
+        "install",
+        "systemctl",
+        "mktemp",
+        "chmod",
+        "id",
+        "rm",
+        "realpath"
+      ]
     },
     "setup.security.sudoless-docker": {
       "match": {
