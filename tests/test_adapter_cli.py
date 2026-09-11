@@ -73,6 +73,7 @@ class StrictLoadingTests(unittest.TestCase):
             {},
             {"schemaVersion": 2, "rules": {}},
             {"schemaVersion": 1, "rules": []},
+            {**valid, "enforcementMode": "allow-everything"},
             {**valid, "rules": {"one": {"mode": "mapped"}}},
             _compat("one", "safe", {"mode": "argv", "argv": []}),
             _compat("one", "safe", {"mode": "argv", "argv": ["true", "a\0b"]}),
@@ -158,6 +159,142 @@ class ModelBuilderTests(unittest.TestCase):
 
         self.assertEqual(visible["revision"], hidden["revision"])
         self.assertNotEqual(visible["revision"], changed["revision"])
+
+    def test_advisory_policy_keeps_warned_stock_actions_dispatchable(self) -> None:
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            system, extension, compatibility = self._paths(root)
+            helper = root / "omarchy-helper"
+            helper.write_text("changed", encoding="utf-8")
+            cases = {
+                "explicit incompatibility": (
+                    "stock-action",
+                    {
+                        "match": {"action": "stock-action", "provider": ""},
+                        "mode": "disabled",
+                        "reason": "Hyprland only",
+                        "force_visible": True,
+                    },
+                    "Hyprland only",
+                    {"mode": "shell", "command": "stock-action"},
+                ),
+                "helper digest drift": (
+                    "stock-action",
+                    {
+                        "match": {"action": "stock-action", "provider": ""},
+                        "mode": "pass-through",
+                        "digests": {str(helper): "0" * 64},
+                    },
+                    "Compatibility not reviewed",
+                    {"mode": "shell", "command": "stock-action"},
+                ),
+                "missing mapped dependency": (
+                    "stock-action",
+                    {
+                        "match": {"action": "stock-action", "provider": ""},
+                        "mode": "mapped",
+                        "dispatch": {"mode": "argv", "argv": ["niri", "msg"]},
+                        "requires": ["niri"],
+                    },
+                    "Missing dependency: niri",
+                    {"mode": "argv", "argv": ["niri", "msg"]},
+                ),
+                "changed signature": (
+                    "new-stock-action",
+                    {
+                        "match": {"action": "old-stock-action", "provider": ""},
+                        "mode": "pass-through",
+                    },
+                    "Compatibility not reviewed",
+                    {"mode": "shell", "command": "new-stock-action"},
+                ),
+                "unclassified action": (
+                    "future-stock-action",
+                    None,
+                    "Compatibility not reviewed",
+                    {"mode": "shell", "command": "future-stock-action"},
+                ),
+                "unclassified Hyprland action": (
+                    "hyprctl dispatch future-action",
+                    None,
+                    "Hyprland only",
+                    {
+                        "mode": "shell",
+                        "command": "hyprctl dispatch future-action",
+                    },
+                ),
+            }
+
+            for name, (action, rule, reason, dispatch) in cases.items():
+                with self.subTest(name=name):
+                    _write(system, {"one": {"action": action}})
+                    _write(extension, {})
+                    rules = {"one": rule} if rule is not None else {}
+                    _write(
+                        compatibility,
+                        {
+                            "schemaVersion": 1,
+                            "enforcementMode": "advisory",
+                            "omarchyPackage": "fixture",
+                            "rules": rules,
+                        },
+                    )
+
+                    model = menu_adapter.build_model(
+                        system,
+                        extension,
+                        compatibility,
+                        guard_runner=lambda _value: True,
+                        provider_runner=lambda _argv: "",
+                        dependency_available=lambda name: name != "niri",
+                    )
+                    entry = model["entries"]["one"]
+                    public = model["view"]["entries"]["one"]
+
+                    self.assertTrue(entry["enabled"])
+                    self.assertFalse(entry["disabled_state"])
+                    self.assertFalse(entry["compatibility_disabled"])
+                    self.assertEqual(entry["disabled_reason"], reason)
+                    self.assertEqual(entry["dispatch"], dispatch)
+                    self.assertIn("actionToken", public)
+
+    def test_advisory_policy_keeps_failed_provider_visible_and_enabled(self) -> None:
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            system, extension, compatibility = self._paths(root)
+            _write(system, {"fonts": {"provider": "fonts"}})
+            _write(extension, {})
+            _write(
+                compatibility,
+                {
+                    "schemaVersion": 1,
+                    "enforcementMode": "advisory",
+                    "omarchyPackage": "fixture",
+                    "rules": {
+                        "fonts": {
+                            "match": {"action": "", "provider": "fonts"},
+                            "mode": "provider",
+                        }
+                    },
+                },
+            )
+
+            def unavailable(_argv: list[str]) -> str:
+                raise RuntimeError("provider unavailable")
+
+            model = menu_adapter.build_model(
+                system,
+                extension,
+                compatibility,
+                guard_runner=lambda _value: True,
+                provider_runner=unavailable,
+                dependency_available=lambda _name: True,
+            )
+            entry = model["entries"]["fonts"]
+
+            self.assertTrue(entry["enabled"])
+            self.assertFalse(entry["disabled_state"])
+            self.assertEqual(entry["disabled_reason"], "Provider unavailable: fonts")
 
     def test_view_schema_is_exact_redacted_and_tokens_only_enabled_visible_actions(self) -> None:
         entries = menu_adapter.normalize_menu(

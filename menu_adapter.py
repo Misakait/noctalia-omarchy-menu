@@ -268,6 +268,8 @@ def _validate_compatibility(document: object) -> dict[str, object]:
         raise SourceError("Compatibility document must contain an object")
     if type(document.get("schemaVersion")) is not int or document["schemaVersion"] != 1:
         raise SourceError("Compatibility schema version is unsupported")
+    if document.get("enforcementMode", "strict") not in {"strict", "advisory"}:
+        raise SourceError("Compatibility enforcement mode is unsupported")
     if not isinstance(document.get("omarchyPackage", ""), str):
         raise SourceError("Compatibility package must be a string")
     rules = document.get("rules")
@@ -607,6 +609,7 @@ def resolve_compatibility(
     *,
     source: str,
     dependency_available: Callable[[str], bool] | None = None,
+    enforcement_mode: str = "strict",
 ) -> dict[str, object]:
     """Resolve an entry before guards are evaluated.
 
@@ -624,6 +627,7 @@ def resolve_compatibility(
     resolved["effective_guards"] = source_guards
     resolved["compatibility_status"] = "neutral"
     resolved["compatibility_disabled"] = False
+    resolved["compatibility_advisory"] = enforcement_mode == "advisory"
     resolved["force_visible"] = False
     resolved["disabled_reason"] = ""
     resolved.pop("dispatch", None)
@@ -636,16 +640,19 @@ def resolve_compatibility(
 
     if exact and rule is not None:
         mode = _string(rule.get("mode"))
+        advisory_reason = ""
         for name in ("when", "checked", "disabled"):
             if name in rule:
                 resolved["effective_guards"][name] = _string(rule.get(name))
         resolved["force_visible"] = bool(rule.get("force_visible", False))
         if rule_digest_mismatches(rule):
-            resolved["compatibility_status"] = "disabled"
-            resolved["compatibility_disabled"] = True
-            resolved["force_visible"] = True
-            resolved["disabled_reason"] = "Compatibility not reviewed"
-            return resolved
+            if enforcement_mode != "advisory":
+                resolved["compatibility_status"] = "disabled"
+                resolved["compatibility_disabled"] = True
+                resolved["force_visible"] = True
+                resolved["disabled_reason"] = "Compatibility not reviewed"
+                return resolved
+            advisory_reason = "Compatibility not reviewed"
         requires = rule.get("requires", [])
         checker = dependency_available or (
             lambda name: shutil.which(name) is not None
@@ -655,24 +662,43 @@ def resolve_compatibility(
         ):
             missing = next((name for name in requires if not checker(name)), "")
             if missing:
+                if enforcement_mode != "advisory":
+                    resolved["compatibility_status"] = "disabled"
+                    resolved["compatibility_disabled"] = True
+                    resolved["force_visible"] = True
+                    resolved["disabled_reason"] = f"Missing dependency: {missing}"
+                    return resolved
+                advisory_reason = f"Missing dependency: {missing}"
+        if mode in {"disable", "disabled"}:
+            reason = _string(rule.get("reason")) or "Unsupported"
+            if enforcement_mode == "advisory":
+                resolved["compatibility_status"] = "advisory"
+                resolved["force_visible"] = True
+                resolved["disabled_reason"] = reason
+                if action:
+                    resolved["dispatch"] = {"mode": "shell", "command": action}
+            else:
                 resolved["compatibility_status"] = "disabled"
                 resolved["compatibility_disabled"] = True
-                resolved["force_visible"] = True
-                resolved["disabled_reason"] = f"Missing dependency: {missing}"
-                return resolved
-        if mode in {"disable", "disabled"}:
-            resolved["compatibility_status"] = "disabled"
-            resolved["compatibility_disabled"] = True
-            resolved["disabled_reason"] = _string(rule.get("reason")) or "Unsupported"
+                resolved["disabled_reason"] = reason
         elif mode in {"native-fonts", "native-power", "provider"}:
             resolved["compatibility_status"] = "provider"
             resolved["provider_mode"] = mode
+            if advisory_reason:
+                resolved["force_visible"] = True
+                resolved["disabled_reason"] = advisory_reason
         else:
             payload = _rule_dispatch(rule, action)
             if payload is None and (action or provider):
-                resolved["compatibility_status"] = "disabled"
-                resolved["compatibility_disabled"] = True
-                resolved["disabled_reason"] = "Compatibility rule invalid"
+                if enforcement_mode == "advisory" and action:
+                    resolved["compatibility_status"] = "advisory"
+                    resolved["force_visible"] = True
+                    resolved["disabled_reason"] = "Compatibility rule invalid"
+                    resolved["dispatch"] = {"mode": "shell", "command": action}
+                else:
+                    resolved["compatibility_status"] = "disabled"
+                    resolved["compatibility_disabled"] = True
+                    resolved["disabled_reason"] = "Compatibility rule invalid"
             else:
                 resolved["compatibility_status"] = (
                     "pass-through"
@@ -683,9 +709,20 @@ def resolve_compatibility(
                     resolved["dispatch"] = payload
                     if mode == "mapped" and provider:
                         resolved["kind"] = "action"
+                if advisory_reason:
+                    resolved["compatibility_status"] = "advisory"
+                    resolved["force_visible"] = True
+                    resolved["disabled_reason"] = advisory_reason
         return resolved
 
     if isinstance(rule, dict) and source == "system":
+        if enforcement_mode == "advisory":
+            resolved["compatibility_status"] = "advisory"
+            resolved["force_visible"] = True
+            resolved["disabled_reason"] = "Compatibility not reviewed"
+            if action:
+                resolved["dispatch"] = {"mode": "shell", "command": action}
+            return resolved
         resolved["compatibility_status"] = "disabled"
         resolved["compatibility_disabled"] = True
         resolved["force_visible"] = True
@@ -693,19 +730,30 @@ def resolve_compatibility(
         return resolved
 
     if _obviously_incompatible(action):
-        resolved["compatibility_status"] = "disabled"
-        resolved["compatibility_disabled"] = True
+        resolved["compatibility_status"] = (
+            "advisory" if enforcement_mode == "advisory" else "disabled"
+        )
+        resolved["compatibility_disabled"] = enforcement_mode != "advisory"
         resolved["force_visible"] = True
         resolved["disabled_reason"] = "Hyprland only"
+        if enforcement_mode == "advisory" and action:
+            resolved["dispatch"] = {"mode": "shell", "command": action}
     elif provider:
-        resolved["compatibility_status"] = "disabled"
-        resolved["compatibility_disabled"] = True
+        resolved["compatibility_status"] = (
+            "advisory" if enforcement_mode == "advisory" else "disabled"
+        )
+        resolved["compatibility_disabled"] = enforcement_mode != "advisory"
         resolved["force_visible"] = True
         resolved["disabled_reason"] = "Unsupported provider"
     elif not action:
         return resolved
     elif source == "extension":
         resolved["compatibility_status"] = "user-pass-through"
+        resolved["dispatch"] = {"mode": "shell", "command": action}
+    elif enforcement_mode == "advisory":
+        resolved["compatibility_status"] = "advisory"
+        resolved["force_visible"] = True
+        resolved["disabled_reason"] = "Compatibility not reviewed"
         resolved["dispatch"] = {"mode": "shell", "command": action}
     else:
         resolved["compatibility_status"] = "disabled"
@@ -894,8 +942,9 @@ def expand_providers(
             continue
         provider = _string(parent.get("provider"))
         if provider != "fonts":
-            parent["compatibility_status"] = "disabled"
-            parent["compatibility_disabled"] = True
+            advisory = bool(parent.get("compatibility_advisory", False))
+            parent["compatibility_status"] = "advisory" if advisory else "disabled"
+            parent["compatibility_disabled"] = not advisory
             parent["force_visible"] = True
             parent["disabled_reason"] = "Unsupported provider"
             continue
@@ -903,8 +952,9 @@ def expand_providers(
             listed = runner(["omarchy-font-list"])
             current = runner(["omarchy-font-current"]).strip()
         except Exception:
-            parent["compatibility_status"] = "disabled"
-            parent["compatibility_disabled"] = True
+            advisory = bool(parent.get("compatibility_advisory", False))
+            parent["compatibility_status"] = "advisory" if advisory else "disabled"
+            parent["compatibility_disabled"] = not advisory
             parent["force_visible"] = True
             parent["disabled_reason"] = "Provider unavailable: fonts"
             if warnings is not None:
@@ -1060,11 +1110,12 @@ def evaluate_guards(
         disabled_value, disabled_ok = guard("disabled", False)
         force_visible = bool(entry.get("force_visible", False))
         compatibility_disabled = bool(entry.get("compatibility_disabled", False))
+        compatibility_advisory = bool(entry.get("compatibility_advisory", False))
 
         entry["visible"] = force_visible or when_value
         entry["checked_state"] = checked_value or (disabled_value and disabled_ok)
         entry["disabled_state"] = compatibility_disabled or (
-            disabled_value and disabled_ok
+            disabled_value and disabled_ok and not compatibility_advisory
         )
         entry["enabled"] = bool(entry["visible"]) and not bool(entry["disabled_state"])
         if _string(guards.get("disabled")) and not disabled_ok:
@@ -1431,6 +1482,7 @@ def prepare_dispatch_payload(
     system = load_source(system_path)
     extension = load_source(extension_path, required=False)
     compatibility = load_compatibility(compatibility_path)
+    enforcement_mode = _string(compatibility.get("enforcementMode")) or "strict"
     merged = merge_sources(system, extension)
     revision = compute_revision(merged, compatibility)
     if requested_revision != revision:
@@ -1460,6 +1512,7 @@ def prepare_dispatch_payload(
             rules,
             source=_entry_source_owner(requested_id, system, extension, merged),
             dependency_available=dependency_available,
+            enforcement_mode=enforcement_mode,
         )
         if resolved.get("kind") == "action":
             evaluated, _warnings = evaluate_guards(
@@ -1508,6 +1561,7 @@ def build_model(
     extension_loaded = extension_path.exists()
     extension = load_source(extension_path, required=False)
     compatibility = load_compatibility(compatibility_path)
+    enforcement_mode = _string(compatibility.get("enforcementMode")) or "strict"
     merged = merge_sources(system, extension)
     revision = compute_revision(merged, compatibility)
     normalized = normalize_menu(merged)
@@ -1526,6 +1580,7 @@ def build_model(
             rules,
             source=_entry_source_owner(menu_id, system, extension, merged),
             dependency_available=dependency_available,
+            enforcement_mode=enforcement_mode,
         )
 
     provider_warnings: list[str] = []

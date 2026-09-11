@@ -320,6 +320,7 @@ def main() -> None:
 
     document = {
         "schemaVersion": 1,
+        "enforcementMode": "advisory",
         "stockSource": str(STOCK_MENU),
         "omarchyPackage": "omarchy-dev 4.0.0.r2014.gf99d33a-1",
         "rules": rules,

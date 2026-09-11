@@ -12,7 +12,7 @@
 - 将已审查的 Hyprland/Omarchy Shell 操作映射到 Niri 或 Noctalia。
 - 保留 Omarchy 原有的 Install、Remove、Update、About、System 等菜单结构。
 - 支持搜索、鼠标、方向键、翻页键和层级导航。
-- 不兼容的项目仍会显示，但会被禁用并标出原因。
+- 不兼容或尚未审查的项目仍可执行，并会在项目下方标出不推荐使用的原因。
 - 首次成功加载后缓存已脱敏的视图；再次打开时先显示缓存，再在后台刷新。
 - 叶子操作使用目标级校验，避免在执行前重新计算所有无关菜单状态。
 
@@ -39,7 +39,7 @@
       <img src="docs/screenshots/main-menu.png" alt="Noctalia 中的 Omarchy Menu 主菜单，显示 Apps、Learn、Trigger、Style、Setup、Install、Remove 和 Update 等项目">
     </td>
     <td>
-      <img src="docs/screenshots/trigger-menu.png" alt="Omarchy Menu 的 Trigger 子菜单，Reminder 被选中，Emoji 和 Transcode 显示为禁用并附有原因">
+      <img src="docs/screenshots/trigger-menu.png" alt="Omarchy Menu 的 Trigger 子菜单，Reminder 被选中，Emoji 和 Transcode 显示兼容性提示">
     </td>
   </tr>
 </table>
@@ -53,7 +53,7 @@
 - Niri
 - Python 3
 
-`plugin.toml` 声明的直接依赖是 `python3` 和 `omarchy`。部分可选功能还需要下列命令；缺少依赖时，相应菜单项会被安全禁用：
+`plugin.toml` 声明的直接依赖是 `python3` 和 `omarchy`。部分可选功能还需要下列命令；缺少依赖时，相应菜单项仍可点击，但会显示提示且执行可能失败：
 
 | 功能 | 额外命令 |
 | --- | --- |
@@ -69,7 +69,7 @@ OCR 默认使用英语。可通过环境变量指定已安装的 Tesseract 语�
 
 仓库当前审计的是 `omarchy-dev 4.0.0.r2014.gf99d33a-1`（上游提交 [`f99d33a`](https://github.com/basecamp/omarchy/commit/f99d33a)）以及 Noctalia `5.0.0-beta.10` / 插件 API 24。
 
-`compatibility.json` 会精确固定 Omarchy 辅助脚本的内容摘要，因此其他 Omarchy 构建即使菜单结构相同，也可能将受影响的操作安全禁用。安装后请先运行 `python3 tools/audit_compatibility.py`；若不是 `ok: true`，请等待对应快照更新或按下文流程完成审查，不要直接替换摘要。
+`compatibility.json` 会精确固定 Omarchy 辅助脚本的内容摘要。当前使用 `advisory` 策略：其他 Omarchy 构建即使导致摘要或签名变化，受影响的操作也不会被禁用，而会显示兼容性提示并执行本机当前的上游命令。安装后仍建议运行 `python3 tools/audit_compatibility.py` 了解变化。
 
 ## 安装
 
@@ -140,10 +140,11 @@ niri validate
 
 - 插件本身不增加二次确认，以保持 Omarchy 原版菜单的交互；Omarchy 命令自身已有的提示和确认仍会保留。
 - `Setup → Security → Passwordless Sudo` 保留原版的风险确认，但改为本次开机有效：首次运行验证管理员密码并启用，再次运行立即关闭；重启时由 Omarchy 的 `systemd-tmpfiles` 规则清除。缺少该开机清理规则时会拒绝启用。
-- 每个 Omarchy 系统 action/provider 必须匹配 `compatibility.json` 中的精确签名。
-- 已审查的 `omarchy-*` 辅助脚本及其依赖闭包使用 SHA-256 固定；脚本变更后对应操作会失败关闭，而不是静默放行。
+- 已审查的 Niri/Noctalia 映射仍要求精确签名；签名不匹配时会提示未经审查，并改为执行本机菜单提供的当前上游 action。
+- 已审查的 `omarchy-*` 辅助脚本及其依赖闭包使用 SHA-256 固定；脚本变更后会显示 `Compatibility not reviewed`，但按当前 `advisory` 策略仍允许执行。
+- `advisory` 是有意采用的放行策略：带提示的操作可能执行失败，也可能调用只适用于 Hyprland 或 Omarchy Shell 的命令；请只在信任当前已安装 Omarchy 软件包时使用。
 - 面板只收到经过白名单过滤的视图模型，不包含原始 action、dispatch 载荷或 guard。
-- 执行时必须同时匹配当前 revision、菜单 ID 和不透明 action token，并重新检查所选项目的可见性、启用状态和依赖。
+- 执行时仍必须同时匹配当前 revision、菜单 ID 和不透明 action token，并重新检查所选项目的可见性与启用状态。
 - 脚本映射只能从插件目录内解析，子进程使用关闭的标准流并与适配器进程分离。
 - 永远不要直接修改 `/usr/share/omarchy`；该目录由 Omarchy 软件包管理。
 
@@ -157,7 +158,7 @@ python3 menu_adapter.py audit
 python3 tools/audit_compatibility.py
 ```
 
-退出码为 `0` 且报告中的 `ok` 为 `true` 才表示当前兼容清单完整。失败时，现有清单会让新增或改变的操作保持不可执行。
+退出码为 `0` 且报告中的 `ok` 为 `true` 才表示当前兼容清单完整。失败时，新增或改变的操作会显示警告，但不会被兼容层禁用。
 
 不要在未审查差异时直接发布重新生成的清单。维护者流程是：
 
@@ -199,7 +200,7 @@ tests/                       Python 与 Luau 契约测试
 
 ## English
 
-Noctalia Omarchy Menu exposes the full Omarchy 4 menu as a native Noctalia 5 panel for Niri. It reads the installed Omarchy menu, maps reviewed compositor-specific actions to Niri/Noctalia, keeps unsupported entries visible but disabled, and never starts Omarchy Shell.
+Noctalia Omarchy Menu exposes the full Omarchy 4 menu as a native Noctalia 5 panel for Niri. It reads the installed Omarchy menu, maps reviewed compositor-specific actions to Niri/Noctalia, keeps unsupported entries actionable with an advisory reason, and never starts Omarchy Shell.
 
 The panel requires plugin API 24. Install the runtime files into `~/.local/share/noctalia/plugins/omarchy-menu`, enable `misakait/omarchy-menu`, and bind `Mod+Alt+Space` to:
 
@@ -207,7 +208,7 @@ The panel requires plugin API 24. Install the runtime files into `~/.local/share
 noctalia msg panel-toggle misakait/omarchy-menu:menu
 ```
 
-Cached data is a redacted view model only; every open triggers a background refresh. Action dispatch is fail-closed and validates the current revision, entry ID, action token, state, exact compatibility signature, and audited helper digests. The plugin adds no extra confirmation, so real update/install/remove/power actions should be selected with care.
+Cached data is a redacted view model only; every open triggers a background refresh. Dispatch still validates the current revision, entry ID, action token and state, while compatibility signature, digest and dependency failures are advisory rather than blocking. The plugin adds no extra confirmation, so real update/install/remove/power actions should be selected with care.
 
 After every Omarchy upgrade, run `python3 tools/audit_compatibility.py`. Do not regenerate and publish `compatibility.json` until every upstream change has been reviewed and the full test suite passes.
 

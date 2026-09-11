@@ -1,5 +1,6 @@
 {
   "schemaVersion": 1,
+  "enforcementMode": "advisory",
   "stockSource": "/usr/share/omarchy/default/omarchy/omarchy-menu.jsonc",
   "omarchyPackage": "omarchy-dev 4.0.0.r2014.gf99d33a-1",
   "rules": {

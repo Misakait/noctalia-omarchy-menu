@@ -55,6 +55,29 @@ class CompatibilityInventoryTests(unittest.TestCase):
                     rule["mode"], {"pass-through", "mapped", "provider", "disabled"}
                 )
 
+    def test_advisory_policy_never_compatibility_disables_stock_actions(self) -> None:
+        self.assertEqual(self.document.get("enforcementMode"), "advisory")
+        with TemporaryDirectory() as directory:
+            extension = Path(directory) / "extension.jsonc"
+            extension.write_text("{}\n", encoding="utf-8")
+            model = menu_adapter.build_model(
+                STOCK_MENU,
+                extension,
+                COMPATIBILITY,
+                guard_runner=lambda _value: True,
+                provider_runner=lambda _argv: "",
+                dependency_available=lambda _name: False,
+            )
+
+        for menu_id, fields in self.source.items():
+            if not fields.get("action"):
+                continue
+            with self.subTest(menu_id=menu_id):
+                entry = model["entries"][menu_id]
+                self.assertFalse(entry["compatibility_disabled"])
+                self.assertFalse(entry["disabled_state"])
+                self.assertIn("dispatch", entry)
+
     def test_mapped_rule_resolves_nested_dispatch_for_exact_signature(self) -> None:
         entry = menu_adapter.normalize_menu(
             {"trigger.capture.screenshot": self.source["trigger.capture.screenshot"]}

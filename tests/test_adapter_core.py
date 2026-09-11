@@ -142,6 +142,19 @@ class GuardEvaluationTests(unittest.TestCase):
         self.assertTrue(all("failure" not in warning for warning in warnings))
         self.assertTrue(all("timeout" not in warning for warning in warnings))
 
+    def test_advisory_policy_keeps_upstream_disabled_guard_as_checked_only(self) -> None:
+        entry = _entry("already-installed", disabled="already-installed")
+        entry["compatibility_advisory"] = True
+
+        evaluated, warnings = menu_adapter.evaluate_guards(
+            {"already-installed": entry}, lambda _expression: True
+        )
+
+        self.assertTrue(evaluated["already-installed"]["checked_state"])
+        self.assertFalse(evaluated["already-installed"]["disabled_state"])
+        self.assertTrue(evaluated["already-installed"]["enabled"])
+        self.assertEqual(warnings, [])
+
     def test_identical_guard_expression_is_evaluated_once(self) -> None:
         calls: Counter[str] = Counter()
 
